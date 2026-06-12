@@ -1,0 +1,372 @@
+[
+  {
+    "origin": "repo",
+    "name": "truncate",
+    "signature": "fn truncate(mut s: String) -> String",
+    "file": "src/tools.rs",
+    "line": 113,
+    "fan_in": 2,
+    "score": 6,
+    "purpose": "Truncates string to max length"
+  },
+  {
+    "origin": "futures-util",
+    "name": "poll",
+    "signature": "pub fn poll<F: Future + Unpin>(future: F) -> PollOnce<F>",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.32/src/async_await/poll.rs",
+    "line": 24,
+    "fan_in": 16,
+    "score": 10,
+    "purpose": "Wrap future for single poll"
+  },
+  {
+    "origin": "futures-util",
+    "name": "iter",
+    "signature": "pub fn iter<I>(i: I) -> Iter<I::IntoIter>",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.32/src/stream/iter.rs",
+    "line": 46,
+    "fan_in": 8,
+    "score": 10,
+    "purpose": "Convert Iterator into Stream"
+  },
+  {
+    "origin": "futures-util",
+    "name": "drain",
+    "signature": "pub fn drain<T>() -> Drain<T>",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.32/src/sink/drain.rs",
+    "line": 29,
+    "fan_in": 3,
+    "score": 6,
+    "purpose": "Sink discarding all items"
+  },
+  {
+    "origin": "futures-util",
+    "name": "ok",
+    "signature": "pub fn ok<T, E>(t: T) -> Ready<Result<T, E>>",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.32/src/future/ready.rs",
+    "line": 64,
+    "fan_in": 2,
+    "score": 4,
+    "purpose": "Ready future with Ok value"
+  },
+  {
+    "origin": "futures-util",
+    "name": "select_all",
+    "signature": "pub fn select_all<I>(iter: I) -> SelectAll<I::Item>",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.32/src/future/select_all.rs",
+    "line": 34,
+    "fan_in": 2,
+    "score": 4,
+    "purpose": "Race many futures or streams"
+  },
+  {
+    "origin": "futures-util",
+    "name": "select_all",
+    "signature": "pub fn select_all<I>(iter: I) -> SelectAll<I::Item>",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.32/src/future/select_all.rs",
+    "line": 34,
+    "fan_in": 2,
+    "score": 4,
+    "purpose": "Race many futures or streams"
+  },
+  {
+    "origin": "futures-util",
+    "name": "try_join_all",
+    "signature": "pub fn try_join_all<I>(iter: I) -> TryJoinAll<I::Item>",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.32/src/future/try_join_all.rs",
+    "line": 117,
+    "fan_in": 1,
+    "score": 2,
+    "purpose": "Join all TryFutures into Result"
+  },
+  {
+    "origin": "futures-util",
+    "name": "join_all",
+    "signature": "pub fn join_all<I>(iter: I) -> JoinAll<I::Item>",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-util-0.3.32/src/future/join_all.rs",
+    "line": 102,
+    "fan_in": 1,
+    "score": 2,
+    "purpose": "Join all futures into Vec"
+  },
+  {
+    "origin": "memchr",
+    "name": "memchr",
+    "signature": "pub fn memchr(needle: u8, haystack: &[u8]) -> Option<usize>",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/memchr-2.8.2/src/memchr.rs",
+    "line": 27,
+    "fan_in": 3,
+    "score": 6,
+    "purpose": "Generic byte search utility"
+  },
+  {
+    "origin": "memchr",
+    "name": "memrchr",
+    "signature": "pub fn memrchr(needle: u8, haystack: &[u8]) -> Option<usize>",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/memchr-2.8.2/src/memchr.rs",
+    "line": 59,
+    "fan_in": 2,
+    "score": 4,
+    "purpose": "Generic reverse byte search"
+  },
+  {
+    "origin": "memchr",
+    "name": "find",
+    "signature": "pub fn find(haystack: &[u8], needle: &[u8]) -> Option<usize>",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/memchr-2.8.2/src/memmem/mod.rs",
+    "line": 185,
+    "fan_in": 5,
+    "score": 10,
+    "purpose": "Generic substring search in bytes"
+  },
+  {
+    "origin": "memchr",
+    "name": "rfind",
+    "signature": "pub fn rfind(haystack: &[u8], needle: &[u8]) -> Option<usize>",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/memchr-2.8.2/src/memmem/mod.rs",
+    "line": 222,
+    "fan_in": 3,
+    "score": 6,
+    "purpose": "Generic reverse substring search"
+  },
+  {
+    "origin": "memchr",
+    "name": "is_prefix",
+    "signature": "pub fn is_prefix(haystack: &[u8], needle: &[u8]) -> bool",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/memchr-2.8.2/src/arch/all/mod.rs",
+    "line": 26,
+    "fan_in": 1,
+    "score": 2,
+    "purpose": "Check byte-slice prefix"
+  },
+  {
+    "origin": "memchr",
+    "name": "is_suffix",
+    "signature": "pub fn is_suffix(haystack: &[u8], needle: &[u8]) -> bool",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/memchr-2.8.2/src/arch/all/mod.rs",
+    "line": 42,
+    "fan_in": 1,
+    "score": 2,
+    "purpose": "Check byte-slice suffix"
+  },
+  {
+    "origin": "memchr",
+    "name": "is_equal",
+    "signature": "pub fn is_equal(x: &[u8], y: &[u8]) -> bool",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/memchr-2.8.2/src/arch/all/mod.rs",
+    "line": 65,
+    "fan_in": 1,
+    "score": 2,
+    "purpose": "Compare byte slices for equality"
+  },
+  {
+    "origin": "percent-encoding",
+    "name": "percent_encode_byte",
+    "signature": "pub fn percent_encode_byte(byte: u8) -> &'static str",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/percent-encoding-2.3.2/src/lib.rs",
+    "line": 73,
+    "fan_in": 1,
+    "score": 2,
+    "purpose": "Encode byte to %XX form"
+  },
+  {
+    "origin": "percent-encoding",
+    "name": "percent_encode",
+    "signature": "pub fn percent_encode<'a>(input: &'a [u8], ascii_set: &'static AsciiSet) -> PercentEncode<'a>",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/percent-encoding-2.3.2/src/lib.rs",
+    "line": 117,
+    "fan_in": 1,
+    "score": 2,
+    "purpose": "Percent-encode byte slice"
+  },
+  {
+    "origin": "percent-encoding",
+    "name": "utf8_percent_encode",
+    "signature": "pub fn utf8_percent_encode<'a>(input: &'a str, ascii_set: &'static AsciiSet) -> PercentEncode<'a>",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/percent-encoding-2.3.2/src/lib.rs",
+    "line": 136,
+    "fan_in": 1,
+    "score": 2,
+    "purpose": "percent-encode a UTF-8 string"
+  },
+  {
+    "origin": "percent-encoding",
+    "name": "percent_decode_str",
+    "signature": "pub fn percent_decode_str(input: &str) -> PercentDecode<'_>",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/percent-encoding-2.3.2/src/lib.rs",
+    "line": 217,
+    "fan_in": 0,
+    "score": 2,
+    "purpose": "percent-decode a string"
+  },
+  {
+    "origin": "percent-encoding",
+    "name": "percent_decode",
+    "signature": "pub fn percent_decode(input: &[u8]) -> PercentDecode<'_>",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/percent-encoding-2.3.2/src/lib.rs",
+    "line": 240,
+    "fan_in": 1,
+    "score": 2,
+    "purpose": "percent-decode a byte slice"
+  },
+  {
+    "origin": "rand",
+    "name": "random",
+    "signature": "pub fn random<T>() -> T",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rand-0.9.4/src/lib.rs",
+    "line": 141,
+    "fan_in": 5,
+    "score": 10,
+    "purpose": "generate random value of any type"
+  },
+  {
+    "origin": "rand",
+    "name": "random_range",
+    "signature": "pub fn random_range<T, R>(range: R) -> T",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rand-0.9.4/src/lib.rs",
+    "line": 186,
+    "fan_in": 10,
+    "score": 10,
+    "purpose": "generate random value in range"
+  },
+  {
+    "origin": "rand",
+    "name": "random_bool",
+    "signature": "pub fn random_bool(p: f64) -> bool",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rand-0.9.4/src/lib.rs",
+    "line": 211,
+    "fan_in": 2,
+    "score": 4,
+    "purpose": "random bool with probability p"
+  },
+  {
+    "origin": "rand",
+    "name": "random_ratio",
+    "signature": "pub fn random_ratio(numerator: u32, denominator: u32) -> bool",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rand-0.9.4/src/lib.rs",
+    "line": 243,
+    "fan_in": 3,
+    "score": 6,
+    "purpose": "random bool with numerator/denominator"
+  },
+  {
+    "origin": "rand",
+    "name": "fill",
+    "signature": "pub fn fill<T: Fill + ?Sized>(dest: &mut T)",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rand-0.9.4/src/lib.rs",
+    "line": 265,
+    "fan_in": 3,
+    "score": 6,
+    "purpose": "fill value with random data"
+  },
+  {
+    "origin": "rand",
+    "name": "rng",
+    "signature": "pub fn rng() -> ThreadRng",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rand-0.9.4/src/rngs/thread.rs",
+    "line": 157,
+    "fan_in": 15,
+    "score": 10,
+    "purpose": "get thread-local random number generator"
+  },
+  {
+    "origin": "rand",
+    "name": "sample",
+    "signature": "pub fn sample<R>(rng: &mut R, length: usize, amount: usize) -> IndexVec",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rand-0.9.4/src/seq/index.rs",
+    "line": 240,
+    "fan_in": 12,
+    "score": 10,
+    "purpose": "randomly sample indices from 0..length"
+  },
+  {
+    "origin": "rand",
+    "name": "sample_weighted",
+    "signature": "pub fn sample_weighted<R, F, X>(",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rand-0.9.4/src/seq/index.rs",
+    "line": 302,
+    "fan_in": 2,
+    "score": 4,
+    "purpose": "weighted random index sampling"
+  },
+  {
+    "origin": "regex",
+    "name": "escape",
+    "signature": "pub fn escape(pattern: &str) -> alloc::string::String",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/regex-1.12.4/src/lib.rs",
+    "line": 1351,
+    "fan_in": 1,
+    "score": 2,
+    "purpose": "escape regex meta-characters in string"
+  },
+  {
+    "origin": "ring",
+    "name": "as_chunks",
+    "signature": "pub fn as_chunks<T, const N: usize>(slice: &[T]) -> (AsChunks<T, N>, &[T])",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ring-0.17.14/src/polyfill/slice/as_chunks.rs",
+    "line": 19,
+    "fan_in": 8,
+    "score": 12,
+    "purpose": "Chunk slice into arrays at compile-time"
+  },
+  {
+    "origin": "ring",
+    "name": "as_chunks_mut",
+    "signature": "pub fn as_chunks_mut<T, const N: usize>(slice: &mut [T]) -> (AsChunksMut<T, N>, &mut [T])",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ring-0.17.14/src/polyfill/slice/as_chunks_mut.rs",
+    "line": 18,
+    "fan_in": 4,
+    "score": 10,
+    "purpose": "Mutable chunk slice into arrays"
+  },
+  {
+    "origin": "ring",
+    "name": "overwrite_at_start",
+    "signature": "pub fn overwrite_at_start<T: Copy>(a: &mut [T], b: &[T])",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ring-0.17.14/src/polyfill/sliceutil.rs",
+    "line": 19,
+    "fan_in": 6,
+    "score": 10,
+    "purpose": "Copy first N elements between slices"
+  },
+  {
+    "origin": "same-file",
+    "name": "is_same_file",
+    "signature": "pub fn is_same_file<P, Q>(path1: P, path2: Q) -> io::Result<bool>",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/same-file-1.0.6/src/lib.rs",
+    "line": 370,
+    "fan_in": 0,
+    "score": 2,
+    "purpose": "Compare if two paths refer to same file"
+  },
+  {
+    "origin": "wasm-bindgen-shared",
+    "name": "escape_string",
+    "signature": "pub fn escape_string(s: &str) -> String",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wasm-bindgen-shared-0.2.123/src/lib.rs",
+    "line": 346,
+    "fan_in": 0,
+    "score": 2,
+    "purpose": "Escape backslash, quotes, newlines in strings"
+  },
+  {
+    "origin": "windows-sys",
+    "name": "decode_utf8_char",
+    "signature": "pub const fn decode_utf8_char(bytes: &[u8], mut pos: usize) -> Option<(u32, usize)>",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-sys-0.52.0/src/core/literals.rs",
+    "line": 42,
+    "fan_in": 1,
+    "score": 2,
+    "purpose": "Decode one UTF-8 char from bytes"
+  },
+  {
+    "origin": "writeable",
+    "name": "to_string_or_borrow",
+    "signature": "pub fn to_string_or_borrow<'a>(",
+    "file": "/home/jodie/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/writeable-0.6.3/src/to_string_or_borrow.rs",
+    "line": 203,
+    "fan_in": 0,
+    "score": 2,
+    "purpose": "Writeable to Cow str, borrowing when unchanged"
+  }
+]

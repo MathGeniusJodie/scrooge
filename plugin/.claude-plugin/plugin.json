@@ -1,0 +1,6 @@
+{
+  "name": "scrooge",
+  "description": "Token-miserly coding: Claude plans from compact code-map briefs and dispatches legwork to Cratchit, a cheap model. Never pays for tokens a deterministic tool can replace.",
+  "version": "0.1.0",
+  "author": { "name": "Jodie" }
+}

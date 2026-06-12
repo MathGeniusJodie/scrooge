@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "scrooge": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/scrooge",
+      "args": ["-r", "${CLAUDE_PROJECT_DIR}", "mcp-serve"]
+    }
+  }
+}
