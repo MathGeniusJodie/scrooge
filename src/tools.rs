@@ -136,6 +136,9 @@ const MAX_OUTPUT: usize = 8000;
 /// "read line ranges" rule is enforced in code rather than pleaded in prompts.
 const MAX_WHOLE_FILE_LINES: usize = 400;
 
+/// Largest line range a single read_file call returns.
+const MAX_RANGE_LINES: usize = 250;
+
 /// Whitespace-tolerant match: byte ranges of line windows whose trimmed
 /// lines equal the trimmed lines of `find`.
 fn fuzzy_match_ranges(content: &str, find: &str) -> Vec<(usize, usize)> {
@@ -231,14 +234,24 @@ impl Toolbox {
                 let end = args["end_line"].as_u64().map(|n| n as usize);
                 Ok(match (start, end) {
                     (Some(a), b) => {
-                        let b = b.unwrap_or(usize::MAX);
-                        content
+                        // Cap range size too, or 1..999999 would bypass the
+                        // whole-file guard below.
+                        let wanted = b.unwrap_or(usize::MAX);
+                        let capped = wanted.min(a.saturating_add(MAX_RANGE_LINES - 1));
+                        let mut out = content
                             .lines()
                             .enumerate()
-                            .filter(|(i, _)| *i + 1 >= a && *i < b)
+                            .filter(|(i, _)| *i + 1 >= a && *i < capped)
                             .map(|(i, l)| format!("{}|{l}", i + 1))
                             .collect::<Vec<_>>()
-                            .join("\n")
+                            .join("\n");
+                        if capped < wanted && capped < content.lines().count() {
+                            out.push_str(&format!(
+                                "\n[range clamped to {MAX_RANGE_LINES} lines; \
+                                 request another range to continue]"
+                            ));
+                        }
+                        out
                     }
                     _ => {
                         let total = content.lines().count();
@@ -304,27 +317,7 @@ impl Toolbox {
                 let m = codemap::build(&self.root)?;
                 Ok(m.callees_of(&s("name")).join("\n"))
             }
-            "helpers" => {
-                // Prefer the validated cache; fall back to a repo-only scan
-                // (full dependency scans are done via `scrooge helpers --deps`).
-                let list = crate::helpers::load_cache(&self.root)
-                    .map(Ok)
-                    .unwrap_or_else(|| crate::helpers::repo_helpers(&self.root))?;
-                let filter = s("filter").to_lowercase();
-                let filtered: Vec<_> = list
-                    .into_iter()
-                    .filter(|h| {
-                        filter.is_empty()
-                            || h.name.to_lowercase().contains(&filter)
-                            || h.purpose
-                                .as_deref()
-                                .unwrap_or("")
-                                .to_lowercase()
-                                .contains(&filter)
-                    })
-                    .collect();
-                Ok(crate::helpers::render(&filtered))
-            }
+            "helpers" => crate::helpers::filtered_listing(&self.root, &s("filter")),
             "query_docs" => self.query_docs(&s("lang"), &s("query")).await,
             "search_libraries" => web_search(&s("query")).await,
             "add_dependency" => {

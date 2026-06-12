@@ -369,6 +369,28 @@ fn resolve_calls(map: &mut CodeMap) {
     map.calls = resolved;
 }
 
+/// True when `needle` occurs in `haystack` delimited by non-identifier
+/// characters, so "rust" doesn't match "frustrating" and a function named
+/// `run` doesn't match "running".
+pub fn contains_word(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    let mut from = 0;
+    while let Some(i) = haystack[from..].find(needle) {
+        let i = from + i;
+        let j = i + needle.len();
+        let before_ok = !haystack[..i].chars().next_back().is_some_and(ident);
+        let after_ok = !haystack[j..].chars().next().is_some_and(ident);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = j;
+    }
+    false
+}
+
 /// `Client.chat` matches queries "chat" and "Client.chat".
 fn name_matches(qualified: &str, query: &str) -> bool {
     qualified == query || qualified.ends_with(&format!(".{query}"))
@@ -391,7 +413,12 @@ impl CodeMap {
     fn file_line(file: &Path, syms: &[&Symbol]) -> String {
         let packed = syms
             .iter()
-            .map(|s| format!("{} {}@{}", s.kind.short(), s.name, s.line))
+            .map(|s| match s.kind {
+                // Functions/methods are the unmarked default; only the rarer
+                // kinds pay for a label.
+                SymbolKind::Function | SymbolKind::Method => format!("{}@{}", s.name, s.line),
+                _ => format!("{} {}@{}", s.kind.short(), s.name, s.line),
+            })
             .collect::<Vec<_>>()
             .join(", ");
         format!("{}: {packed}\n", file.display())
@@ -423,7 +450,9 @@ impl CodeMap {
                 || (!stem.is_empty() && text.contains(&stem))
                 || syms.iter().any(|s| {
                     let bare = s.name.rsplit('.').next().unwrap_or(&s.name);
-                    bare.len() > 2 && text.contains(&bare.to_lowercase())
+                    // Short names (run, new, map, ...) match everything and
+                    // would silently inflate the slice back to the full brief.
+                    bare.len() >= 4 && contains_word(&text, &bare.to_lowercase())
                 });
             if relevant {
                 out.push_str(&Self::file_line(file, &syms));
@@ -481,5 +510,19 @@ impl CodeMap {
             .filter(|(caller, _)| name_matches(caller, name))
             .flat_map(|(_, callees)| callees.iter().cloned())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn contains_word_respects_identifier_boundaries() {
+        assert!(super::contains_word("update the rust tests", "rust"));
+        assert!(super::contains_word("rust", "rust"));
+        assert!(super::contains_word("fix codemap.rs build", "build"));
+        assert!(!super::contains_word("frustrating", "rust"));
+        assert!(!super::contains_word("running the suite", "run"));
+        assert!(!super::contains_word("my_run_helper", "run"));
+        assert!(!super::contains_word("anything", ""));
     }
 }

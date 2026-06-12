@@ -11,7 +11,7 @@ fn matches(header: &str, topic_lower: &str) -> bool {
         .flat_map(|p| p.split_whitespace())
         .map(|w| w.trim().to_lowercase())
         .filter(|w| w.len() > 2)
-        .any(|k| topic_lower.contains(&k))
+        .any(|k| crate::codemap::contains_word(topic_lower, &k))
 }
 
 /// Full text of every section relevant to the topic (for Cratchit).

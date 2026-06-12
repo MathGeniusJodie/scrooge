@@ -65,7 +65,7 @@ fn tool_list() -> Value {
         ),
         tool(
             "give_cratchit_task",
-            "Dispatch a concrete task to Cratchit, a cheap agent with full tool access (files, shell, python, wolfram, docs, call graph). He executes, verifies, and returns a report of at most 6 lines. Use this for ALL file reading, editing, and verification instead of doing it yourself.",
+            "Dispatch a concrete task to Cratchit, a cheap agent with full tool access (files, shell, python, wolfram, docs, call graph). He executes and returns a short report ending with machine-generated CHANGED (git diffstat) and CHECKS (format/test/lint verdict) lines — trust those over his claims; mechanical check failures are already retried automatically. Use this for ALL file reading, editing, and verification instead of doing it yourself.",
             json!({
                 "task": {"type": "string", "description": "overall goal, one line"},
                 "instructions": {"type": "string", "description": "numbered concrete steps naming exact files/symbols"}
@@ -158,25 +158,7 @@ impl Server {
                 .callees_of(&s("name"))
                 .join("\n")),
             "best_practices" => Ok(practices::relevant_sections(&s("topic"))),
-            "helpers" => {
-                let list = helpers::load_cache(&self.root)
-                    .map(Ok)
-                    .unwrap_or_else(|| helpers::repo_helpers(&self.root))?;
-                let filter = s("filter").to_lowercase();
-                let filtered: Vec<_> = list
-                    .into_iter()
-                    .filter(|h| {
-                        filter.is_empty()
-                            || h.name.to_lowercase().contains(&filter)
-                            || h.purpose
-                                .as_deref()
-                                .unwrap_or("")
-                                .to_lowercase()
-                                .contains(&filter)
-                    })
-                    .collect();
-                Ok(helpers::render(&filtered))
-            }
+            "helpers" => helpers::filtered_listing(&self.root, &s("filter")),
             "give_cratchit_task" => {
                 let (task, instructions) = (s("task"), s("instructions"));
                 self.orchestrator()?.delegate(&task, &instructions).await

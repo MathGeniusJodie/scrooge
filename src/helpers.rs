@@ -319,6 +319,29 @@ pub fn save_cache(root: &Path, helpers: &[Helper]) -> Result<()> {
     Ok(())
 }
 
+/// The `helpers` tool body, shared by the toolbox and the MCP server:
+/// validated cache if present (full scans run via `scrooge helpers --deps`),
+/// repo-only scan otherwise, narrowed by an optional substring filter.
+pub fn filtered_listing(root: &Path, filter: &str) -> Result<String> {
+    let list = load_cache(root)
+        .map(Ok)
+        .unwrap_or_else(|| repo_helpers(root))?;
+    let filter = filter.to_lowercase();
+    let filtered: Vec<_> = list
+        .into_iter()
+        .filter(|h| {
+            filter.is_empty()
+                || h.name.to_lowercase().contains(&filter)
+                || h.purpose
+                    .as_deref()
+                    .unwrap_or("")
+                    .to_lowercase()
+                    .contains(&filter)
+        })
+        .collect();
+    Ok(render(&filtered))
+}
+
 /// Compact one-line-per-helper rendering for LLM consumption.
 pub fn render(helpers: &[Helper]) -> String {
     let mut out = String::new();

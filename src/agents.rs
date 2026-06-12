@@ -4,14 +4,15 @@
 //! everything he sends upstairs.
 //!
 //! Everything that can be decided deterministically is: the code map and
-//! relevant guidance are injected rather than fetched by the model, checks
-//! run after every execution and their verdict is appended to the report,
-//! mechanical check failures loop straight back to Cratchit without burning
-//! a Scrooge round, and DONE is only accepted while checks are green.
+//! relevant guidance are injected rather than fetched by the model; every
+//! execution ends with machine-generated CHANGED (git diffstat) and CHECKS
+//! lines appended to the report; mechanical check failures loop straight
+//! back to Cratchit without burning a Scrooge round; and DONE is only
+//! accepted while checks are green.
 
 use anyhow::Result;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::checks;
 use crate::codemap;
@@ -27,10 +28,10 @@ You never read full files, never write code, and never use tools. You direct Cra
 a junior agent with full tool access (files, shell, python, wolfram, docs, call graph).\n\
 When given a task and a codebase brief, reply with a numbered plan of concrete steps \
 for Cratchit. Each step: one line, imperative, naming exact files/symbols where known. \
-Every Cratchit report ends with a machine-generated CHECKS line (format/test/lint run \
-deterministically) — trust it over Cratchit's own claims. When given a progress report, \
-reply either with corrections/next steps (same format) or the single word DONE if the \
-task is complete and CHECKS is clean. No preamble, no prose.";
+Every Cratchit report ends with machine-generated CHANGED (git diffstat) and CHECKS \
+(format/test/lint verdict) lines — trust those over Cratchit's own claims. When given \
+a progress report, reply either with corrections/next steps (same format) or the \
+single word DONE if the task is complete and CHECKS is clean. No preamble, no prose.";
 
 const CRATCHIT_SYSTEM: &str = "\
 You are Cratchit, a diligent coding agent executing a plan written by Scrooge, \
@@ -62,6 +63,68 @@ const SCROOGE_MAX_TOKENS: u32 = 700;
 /// before the failure is escalated to Scrooge.
 const CHECK_RETRIES: usize = 2;
 
+/// Hard caps enforcing rule 7 (the ≤6-line report) in code: Cratchit's final
+/// message is clamped before anyone expensive reads it.
+const MAX_REPORT_LINES: usize = 12;
+const MAX_REPORT_CHARS: usize = 1200;
+
+/// How much of a check-failure dump Scrooge sees. Cratchit already got the
+/// full output during the retry loop; Scrooge only needs the gist.
+const MAX_FAIL_CHARS: usize = 600;
+
+/// Full briefs larger than this are sliced to task-relevant files on review
+/// rounds (round 1 always gets the full brief — Scrooge is planning then).
+const SLICE_BRIEF_OVER: usize = 4000;
+
+/// Clamp a Cratchit report to the size rule 7 promises.
+fn clamp_report(s: &str) -> String {
+    let mut out = s
+        .lines()
+        .take(MAX_REPORT_LINES)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if out.len() > MAX_REPORT_CHARS {
+        out.truncate(MAX_REPORT_CHARS);
+        out.push_str("\n[report clamped]");
+    } else if s.lines().count() > MAX_REPORT_LINES {
+        out.push_str("\n[report clamped]");
+    }
+    out
+}
+
+/// Keep the tail of `s` (failure summaries end up at the bottom).
+fn tail(s: &str, max_chars: usize) -> String {
+    let s = s.trim();
+    if s.len() <= max_chars {
+        return s.to_string();
+    }
+    let cut = s.len() - max_chars;
+    let cut = s[cut..].find('\n').map_or(cut, |i| cut + i + 1);
+    format!("[...]\n{}", &s[cut..])
+}
+
+/// Worktree state as git sees it: diffstat of tracked changes plus untracked
+/// files. None when the root is not a git repo (or git is unavailable).
+fn worktree_changes(root: &Path) -> Option<String> {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    let diff = git(&["diff", "--stat"])?;
+    let untracked = git(&["status", "--short", "--untracked-files"])
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.starts_with("??"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!("{diff}\n{untracked}").trim().to_string())
+}
+
 pub struct Orchestrator {
     client: Client,
     toolbox: Toolbox,
@@ -84,24 +147,37 @@ impl Orchestrator {
     /// Full task loop: brief -> Scrooge plan -> Cratchit executes -> checks
     /// run -> report -> Scrooge reviews -> ... until DONE or round cap.
     ///
-    /// Scrooge's context is rebuilt every round: system + original brief +
-    /// one-line digests of earlier rounds + only the latest plan/report, so
-    /// his prompt does not grow with superseded history.
+    /// Scrooge's context is rebuilt every round: system + brief (sliced to
+    /// task-relevant files on review rounds when large) + one-line digests of
+    /// earlier rounds + only the latest plan/report, so his prompt does not
+    /// grow with superseded history.
     pub async fn run_task(&mut self, task: &str) -> Result<String> {
         // Deterministic, zero-token context gathering.
-        let brief = codemap::build(&self.toolbox.root)?.brief();
+        let map = codemap::build(&self.toolbox.root)?;
+        let full_brief = map.brief();
         let guidance = practices::summary(task);
 
-        let intro = format!("TASK: {task}\n\nCODEBASE BRIEF:\n{brief}\nKEY GUIDANCE:\n{guidance}");
         let mut digests: Vec<String> = Vec::new();
         let mut last_plan: Option<String> = None;
         let mut last_report: Option<String> = None;
         let mut checks_clean: Option<bool> = None;
 
         for round in 1..=self.max_rounds {
+            let brief = if round == 1 || full_brief.len() <= SLICE_BRIEF_OVER {
+                full_brief.clone()
+            } else {
+                map.brief_for(&format!(
+                    "{task} {} {}",
+                    last_plan.as_deref().unwrap_or(""),
+                    last_report.as_deref().unwrap_or("")
+                ))
+            };
             let mut log = vec![
                 Message::text("system", SCROOGE_SYSTEM),
-                Message::text("user", intro.clone()),
+                Message::text(
+                    "user",
+                    format!("TASK: {task}\n\nCODEBASE BRIEF:\n{brief}\nKEY GUIDANCE:\n{guidance}"),
+                ),
             ];
             if !digests.is_empty() {
                 log.push(Message::text(
@@ -124,19 +200,51 @@ impl Orchestrator {
                     Some(SCROOGE_MAX_TOKENS),
                 )
                 .await?;
-            let plan = plan_msg.content.unwrap_or_default();
+            let mut plan = plan_msg.content.unwrap_or_default();
+            if self.client.last_finish_reason.as_deref() == Some("length") {
+                // The plan was cut mid-step; drop the partial final line
+                // rather than handing Cratchit half an instruction.
+                if let Some(i) = plan.rfind('\n') {
+                    plan.truncate(i);
+                }
+                eprintln!("[scrooge hit the completion cap; dropped partial final step]");
+            }
             eprintln!("--- scrooge (round {round}) ---\n{plan}\n");
 
             if plan.trim().starts_with("DONE") {
                 if checks_clean == Some(false) {
-                    // DONE is not Scrooge's to grant while checks are red.
-                    digests.push(format!("round {round}: DONE rejected (checks failing)"));
+                    // The corrective step is fully determined — route it to
+                    // Cratchit instead of asking Scrooge to spell it out.
+                    let failures = last_report
+                        .as_deref()
+                        .and_then(|r| r.split("CHECKS: FAILING").nth(1))
+                        .unwrap_or("")
+                        .to_string();
+                    let (report, verdict) = self
+                        .execute_and_verify(
+                            task,
+                            &format!(
+                                "The deterministic check suite is failing. Fix the \
+                                 failures below, then verify.\n{failures}"
+                            ),
+                        )
+                        .await?;
+                    if let Some(c) = verdict {
+                        checks_clean = Some(c);
+                    }
+                    if checks_clean == Some(true) {
+                        // Scrooge already ruled DONE pending green checks.
+                        let u = &self.client.usage;
+                        return Ok(format!(
+                            "task complete in {round} round(s). tokens: {} in / {} out",
+                            u.prompt_tokens, u.completion_tokens
+                        ));
+                    }
+                    digests.push(format!(
+                        "round {round}: DONE deferred, cratchit sent to fix checks"
+                    ));
                     last_plan = Some(plan);
-                    last_report = Some(
-                        "DONE not accepted: the deterministic checks are still failing \
-                         (see previous CHECKS output). Issue corrective steps."
-                            .into(),
-                    );
+                    last_report = Some(report);
                     continue;
                 }
                 let u = &self.client.usage;
@@ -146,39 +254,10 @@ impl Orchestrator {
                 ));
             }
 
-            let mut report = self.cratchit_execute(task, &plan).await?;
-            // Deterministic verification; mechanical failures loop straight
-            // back to Cratchit instead of burning a Scrooge round.
-            let mut clean = false;
-            for attempt in 0..=CHECK_RETRIES {
-                let check = self.run_checks().await?;
-                if check.errors.is_empty() && check.warnings.is_empty() {
-                    clean = true;
-                    break;
-                }
-                let rendered = checks::render(&check);
-                if attempt == CHECK_RETRIES {
-                    report.push_str(&format!("\nCHECKS: FAILING\n{rendered}"));
-                    break;
-                }
-                eprintln!(
-                    "--- checks failed (cratchit retry {}) ---\n{rendered}",
-                    attempt + 1
-                );
-                report = self
-                    .cratchit_execute(
-                        task,
-                        &format!(
-                            "The deterministic check suite failed after your last \
-                             changes. Fix the failures below, then verify.\n{rendered}"
-                        ),
-                    )
-                    .await?;
+            let (report, verdict) = self.execute_and_verify(task, &plan).await?;
+            if let Some(c) = verdict {
+                checks_clean = Some(c);
             }
-            if clean {
-                report.push_str("\nCHECKS: clean");
-            }
-            checks_clean = Some(clean);
             eprintln!("--- cratchit report ---\n{report}\n");
 
             digests.push(format!(
@@ -192,20 +271,93 @@ impl Orchestrator {
         Ok("round limit reached without DONE; review output above".into())
     }
 
+    /// Execute instructions via Cratchit, then verify deterministically:
+    /// clamp the report, loop mechanical check failures straight back to
+    /// Cratchit, and append machine-generated CHANGED and CHECKS lines.
+    /// The verdict is None when nothing changed on disk (checks skipped).
+    async fn execute_and_verify(
+        &mut self,
+        task: &str,
+        instructions: &str,
+    ) -> Result<(String, Option<bool>)> {
+        let before = worktree_changes(&self.toolbox.root);
+        let mut report = clamp_report(&self.cratchit_execute(task, instructions).await?);
+
+        let after = worktree_changes(&self.toolbox.root);
+        if let (Some(b), Some(a)) = (&before, &after)
+            && b == a
+        {
+            // Investigation-only call: nothing to verify, say so in code.
+            report.push_str("\nCHANGED: nothing (no file modifications)");
+            return Ok((report, None));
+        }
+
+        let mut clean = false;
+        let mut failures = String::new();
+        for attempt in 0..=CHECK_RETRIES {
+            let check = self.run_checks().await?;
+            if check.errors.is_empty() && check.warnings.is_empty() {
+                clean = true;
+                break;
+            }
+            let rendered = checks::render(&check);
+            if attempt == CHECK_RETRIES {
+                failures = rendered;
+                break;
+            }
+            eprintln!(
+                "--- checks failed (cratchit retry {}) ---\n{rendered}",
+                attempt + 1
+            );
+            report = clamp_report(
+                &self
+                    .cratchit_execute(
+                        task,
+                        &format!(
+                            "The deterministic check suite failed after your last \
+                             changes. Fix the failures below, then verify.\n{rendered}"
+                        ),
+                    )
+                    .await?,
+            );
+        }
+
+        // CHANGED reflects the final worktree, including retry fixes.
+        if let Some(a) = worktree_changes(&self.toolbox.root) {
+            let shown = if a.is_empty() {
+                "worktree clean".to_string()
+            } else {
+                a
+            };
+            report.push_str(&format!("\nCHANGED:\n{shown}"));
+        }
+        if clean {
+            report.push_str("\nCHECKS: clean");
+        } else {
+            report.push_str(&format!(
+                "\nCHECKS: FAILING\n{}",
+                tail(&failures, MAX_FAIL_CHARS)
+            ));
+        }
+        Ok((report, Some(clean)))
+    }
+
     async fn run_checks(&self) -> Result<checks::Report> {
         let root = self.toolbox.root.clone();
         tokio::task::spawn_blocking(move || checks::run(&root)).await?
     }
 
     /// Dispatch a pre-planned task to Cratchit (used by MCP mode, where the
-    /// Claude Code conversation plays Scrooge). Appends the token bill for
-    /// this call only (usage accumulates across the server's lifetime).
+    /// Claude Code conversation plays Scrooge). The report carries the same
+    /// machine-generated CHANGED/CHECKS lines as the native loop, plus the
+    /// token bill for this call only (usage accumulates across the server's
+    /// lifetime).
     pub async fn delegate(&mut self, task: &str, instructions: &str) -> Result<String> {
         let before = (
             self.client.usage.prompt_tokens,
             self.client.usage.completion_tokens,
         );
-        let report = self.cratchit_execute(task, instructions).await?;
+        let (report, _) = self.execute_and_verify(task, instructions).await?;
         let u = &self.client.usage;
         Ok(format!(
             "{report}\n[cratchit tokens: {} in / {} out]",
@@ -325,6 +477,20 @@ impl Orchestrator {
                 log.push(Message::tool_result(&call.id, out));
             }
         }
-        Ok("cratchit hit the tool-call limit without finishing".into())
+        // Tool budget exhausted: force a final report deterministically so
+        // Scrooge never pays a round to read "hit the limit".
+        log.push(Message::text(
+            "user",
+            "STOP: tool budget exhausted. Send your final report for Scrooge now \
+             — at most 6 lines: state reached, what remains, blockers. No tool calls.",
+        ));
+        let msg = self
+            .client
+            .chat("cratchit", &self.cheap_model, &log, &[], None)
+            .await?;
+        Ok(msg
+            .content
+            .filter(|c| !c.trim().is_empty())
+            .unwrap_or_else(|| "cratchit hit the tool-call limit without reporting".into()))
     }
 }

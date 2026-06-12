@@ -65,6 +65,9 @@ pub struct Client {
     api_key: String,
     root: PathBuf,
     pub usage: Usage,
+    /// finish_reason of the most recent completion ("stop", "length", ...),
+    /// so callers can detect a truncated response deterministically.
+    pub last_finish_reason: Option<String>,
 }
 
 impl Client {
@@ -76,6 +79,7 @@ impl Client {
             api_key,
             root,
             usage: Usage::default(),
+            last_finish_reason: None,
         })
     }
 
@@ -123,6 +127,9 @@ impl Client {
             self.usage.completion_tokens += c;
             accounting::record(&self.root, agent, model, p, c);
         }
+        self.last_finish_reason = v["choices"][0]["finish_reason"]
+            .as_str()
+            .map(str::to_string);
         let msg = v["choices"][0]["message"].clone();
         if msg.is_null() {
             bail!("no choices in response: {v}");
