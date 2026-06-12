@@ -71,8 +71,19 @@ fn lang_for(path: &Path) -> Option<Lang> {
 }
 
 const SKIP_DIRS: &[&str] = &[
-    ".git", "target", "node_modules", "__pycache__", ".venv", "venv", "dist", "build",
-    ".scrooge", "tests", "test", "examples", "benches",
+    ".git",
+    "target",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "dist",
+    "build",
+    ".scrooge",
+    "tests",
+    "test",
+    "examples",
+    "benches",
 ];
 
 const MAX_FILE_BYTES: u64 = 262_144;
@@ -99,7 +110,11 @@ pub fn build_limited(root: &Path, max_files: usize) -> Result<CodeMap> {
     {
         let path = entry.path();
         let Some(lang) = lang_for(path) else { continue };
-        if entry.metadata().map(|m| m.len() > MAX_FILE_BYTES).unwrap_or(true) {
+        if entry
+            .metadata()
+            .map(|m| m.len() > MAX_FILE_BYTES)
+            .unwrap_or(true)
+        {
             continue;
         }
         seen += 1;
@@ -142,7 +157,9 @@ fn index_file(map: &mut CodeMap, rel: &Path, src: &str, lang: Lang) -> Result<()
     }
 
     let mut parser = Parser::new();
-    parser.set_language(&ts_language(&lang)).context("grammar")?;
+    parser
+        .set_language(&ts_language(&lang))
+        .context("grammar")?;
     let Some(tree) = parser.parse(src, None) else {
         return Ok(());
     };
@@ -155,10 +172,10 @@ fn collect_scripts(node: Node, bytes: &[u8], f: &mut dyn FnMut(&str)) {
     if node.kind() == "script_element" {
         let mut c = node.walk();
         for child in node.children(&mut c) {
-            if child.kind() == "raw_text" {
-                if let Ok(text) = child.utf8_text(bytes) {
-                    f(text);
-                }
+            if child.kind() == "raw_text"
+                && let Ok(text) = child.utf8_text(bytes)
+            {
+                f(text);
             }
         }
     }
@@ -196,7 +213,11 @@ fn walk(
     let kind = node.kind();
     let def: Option<(SymbolKind, Option<String>)> = match (lang, kind) {
         (Lang::Rust, "function_item") => Some((
-            if parent.is_some() { SymbolKind::Method } else { SymbolKind::Function },
+            if parent.is_some() {
+                SymbolKind::Method
+            } else {
+                SymbolKind::Function
+            },
             name_of(node, bytes),
         )),
         (Lang::Rust, "struct_item") => Some((SymbolKind::Struct, name_of(node, bytes))),
@@ -204,10 +225,15 @@ fn walk(
         (Lang::Rust, "trait_item") => Some((SymbolKind::Trait, name_of(node, bytes))),
         (Lang::Rust, "impl_item") => Some((
             SymbolKind::Impl,
-            node.child_by_field_name("type").map(|n| text(n, bytes).to_string()),
+            node.child_by_field_name("type")
+                .map(|n| text(n, bytes).to_string()),
         )),
         (Lang::Python, "function_definition") => Some((
-            if parent.is_some() { SymbolKind::Method } else { SymbolKind::Function },
+            if parent.is_some() {
+                SymbolKind::Method
+            } else {
+                SymbolKind::Function
+            },
             name_of(node, bytes),
         )),
         (Lang::Python, "class_definition") => Some((SymbolKind::Class, name_of(node, bytes))),
@@ -291,13 +317,13 @@ fn collect_calls(map: &mut CodeMap, bytes: &[u8], node: Node, lang: &Lang, calle
                 .map(|f| callee_name(f, bytes)),
             _ => None,
         };
-        if let Some(name) = callee {
-            if !name.is_empty() {
-                map.calls
-                    .entry(caller.to_string())
-                    .or_default()
-                    .insert(name);
-            }
+        if let Some(name) = callee
+            && !name.is_empty()
+        {
+            map.calls
+                .entry(caller.to_string())
+                .or_default()
+                .insert(name);
         }
         let mut c = n.walk();
         for child in n.children(&mut c) {
@@ -310,11 +336,7 @@ fn collect_calls(map: &mut CodeMap, bytes: &[u8], node: Node, lang: &Lang, calle
 /// `mod::foo` -> foo, `obj.method` -> method, `foo` -> foo.
 fn callee_name(node: Node, bytes: &[u8]) -> String {
     let t = text(node, bytes);
-    let last = t
-        .rsplit(|c| c == '.' || c == ':')
-        .next()
-        .unwrap_or(t)
-        .trim();
+    let last = t.rsplit(['.', ':']).next().unwrap_or(t).trim();
     // Strip generics / call remnants.
     last.split(|c: char| !(c.is_alphanumeric() || c == '_'))
         .next()
@@ -377,7 +399,11 @@ impl CodeMap {
     /// Full detail for a subset of symbols (signatures + edges).
     pub fn detail(&self, name: &str) -> String {
         let mut out = String::new();
-        for s in self.symbols.iter().filter(|s| s.name == name || s.name.ends_with(&format!(".{name}"))) {
+        for s in self
+            .symbols
+            .iter()
+            .filter(|s| s.name == name || s.name.ends_with(&format!(".{name}")))
+        {
             out.push_str(&format!(
                 "{} {} @ {}:{}\n  {}\n",
                 s.kind.short(),

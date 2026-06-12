@@ -1,0 +1,8 @@
+# Per-language check commands run by `scrooge check` after each task.
+# Edit freely (agents may too). Remove a key to skip that stage.
+
+[rust]
+format = "cargo fmt"
+test = "cargo test --quiet"
+lint_fix = "cargo clippy --fix --allow-dirty --allow-staged --quiet 2>/dev/null"
+lint = "cargo clippy --quiet -- -D warnings"

@@ -42,7 +42,10 @@ pub fn definitions() -> Vec<Value> {
         tool(
             "write_file",
             "Create or overwrite a file with the given content.",
-            obj(json!({"path": {"type": "string"}, "content": {"type": "string"}}), &["path", "content"]),
+            obj(
+                json!({"path": {"type": "string"}, "content": {"type": "string"}}),
+                &["path", "content"],
+            ),
         ),
         tool(
             "edit_file",
@@ -98,7 +101,10 @@ pub fn definitions() -> Vec<Value> {
         tool(
             "helpers",
             "List known generic utility functions from this repo AND its dependencies. ALWAYS check here before writing a new helper — do not reinvent the wheel. Optional filter narrows by substring.",
-            obj(json!({"filter": {"type": "string", "description": "substring to match against name/purpose, optional"}}), &[]),
+            obj(
+                json!({"filter": {"type": "string", "description": "substring to match against name/purpose, optional"}}),
+                &[],
+            ),
         ),
         tool(
             "best_practices",
@@ -125,7 +131,11 @@ impl Toolbox {
 
     fn resolve(&self, p: &str) -> PathBuf {
         let path = Path::new(p);
-        if path.is_absolute() { path.to_path_buf() } else { self.root.join(path) }
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.root.join(path)
+        }
     }
 
     pub async fn call(&self, name: &str, args: &Value) -> String {
@@ -149,7 +159,7 @@ impl Toolbox {
                         content
                             .lines()
                             .enumerate()
-                            .filter(|(i, _)| *i + 1 >= a && *i + 1 <= b)
+                            .filter(|(i, _)| *i + 1 >= a && *i < b)
                             .map(|(i, l)| format!("{}|{l}", i + 1))
                             .collect::<Vec<_>>()
                             .join("\n")
@@ -180,7 +190,10 @@ impl Toolbox {
             }
             "shell" => self.run("bash", &["-c", &s("command")]).await,
             "python" => self.run("python3", &["-c", &s("code")]).await,
-            "wolfram" => self.run("wolframscript", &["-code", &s("expression")]).await,
+            "wolfram" => {
+                self.run("wolframscript", &["-code", &s("expression")])
+                    .await
+            }
             "code_map" => Ok(codemap::build(&self.root)?.brief()),
             "symbol_info" => Ok(codemap::build(&self.root)?.detail(&s("name"))),
             "callers" => {
@@ -203,7 +216,11 @@ impl Toolbox {
                     .filter(|h| {
                         filter.is_empty()
                             || h.name.to_lowercase().contains(&filter)
-                            || h.purpose.as_deref().unwrap_or("").to_lowercase().contains(&filter)
+                            || h.purpose
+                                .as_deref()
+                                .unwrap_or("")
+                                .to_lowercase()
+                                .contains(&filter)
                     })
                     .collect();
                 Ok(crate::helpers::render(&filtered))
@@ -217,7 +234,10 @@ impl Toolbox {
     async fn run(&self, prog: &str, args: &[&str]) -> Result<String> {
         let out = tokio::time::timeout(
             std::time::Duration::from_secs(60),
-            Command::new(prog).args(args).current_dir(&self.root).output(),
+            Command::new(prog)
+                .args(args)
+                .current_dir(&self.root)
+                .output(),
         )
         .await
         .map_err(|_| anyhow::anyhow!("timed out after 60s"))??;

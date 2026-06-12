@@ -13,6 +13,21 @@
           { "type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/prompt_submit.py" }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|mcp__scrooge__give_cratchit_task",
+        "hooks": [
+          { "type": "command", "command": "mkdir -p \"$CLAUDE_PROJECT_DIR/.scrooge\" && touch \"$CLAUDE_PROJECT_DIR/.scrooge/dirty\"" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/stop.py", "timeout": 660 }
+        ]
+      }
     ]
   }
 }

@@ -65,8 +65,8 @@ pub struct Client {
 
 impl Client {
     pub fn new() -> Result<Self> {
-        let api_key = std::env::var("OPENROUTER_API_KEY")
-            .context("OPENROUTER_API_KEY is not set")?;
+        let api_key =
+            std::env::var("OPENROUTER_API_KEY").context("OPENROUTER_API_KEY is not set")?;
         Ok(Client {
             http: reqwest::Client::new(),
             api_key,

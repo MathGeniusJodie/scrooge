@@ -27,33 +27,57 @@ fn tool(name: &str, desc: &str, props: Value, required: &[&str]) -> Value {
 
 fn tool_list() -> Value {
     json!([
-        tool("get_brief",
+        tool(
+            "get_brief",
             "Compact codebase map: every file with its functions/classes/line numbers. Call this before anything else; never read source files directly — that's what Cratchit is for.",
-            json!({}), &[]),
-        tool("symbol_info",
+            json!({}),
+            &[]
+        ),
+        tool(
+            "symbol_info",
             "Signature, location, callers and callees of a symbol from the call graph.",
-            json!({"name": {"type": "string"}}), &["name"]),
-        tool("callers",
+            json!({"name": {"type": "string"}}),
+            &["name"]
+        ),
+        tool(
+            "callers",
             "Functions that call the named function.",
-            json!({"name": {"type": "string"}}), &["name"]),
-        tool("callees",
+            json!({"name": {"type": "string"}}),
+            &["name"]
+        ),
+        tool(
+            "callees",
             "Functions the named function calls.",
-            json!({"name": {"type": "string"}}), &["name"]),
-        tool("helpers",
+            json!({"name": {"type": "string"}}),
+            &["name"]
+        ),
+        tool(
+            "helpers",
             "Known generic utility functions in this repo and its dependencies. Check before writing (or asking Cratchit to write) any new helper.",
-            json!({"filter": {"type": "string", "description": "substring filter, optional"}}), &[]),
-        tool("best_practices",
+            json!({"filter": {"type": "string", "description": "substring filter, optional"}}),
+            &[]
+        ),
+        tool(
+            "best_practices",
             "Project best-practice sections matching the given topic keywords.",
-            json!({"topic": {"type": "string"}}), &["topic"]),
-        tool("give_cratchit_task",
+            json!({"topic": {"type": "string"}}),
+            &["topic"]
+        ),
+        tool(
+            "give_cratchit_task",
             "Dispatch a concrete task to Cratchit, a cheap agent with full tool access (files, shell, python, wolfram, docs, call graph). He executes, verifies, and returns a report of at most 6 lines. Use this for ALL file reading, editing, and verification instead of doing it yourself.",
             json!({
                 "task": {"type": "string", "description": "overall goal, one line"},
                 "instructions": {"type": "string", "description": "numbered concrete steps naming exact files/symbols"}
-            }), &["task", "instructions"]),
-        tool("ask_cratchit",
+            }),
+            &["task", "instructions"]
+        ),
+        tool(
+            "ask_cratchit",
             "Have Cratchit investigate a question with his tools and return a compressed answer. Use instead of reading code yourself.",
-            json!({"question": {"type": "string"}}), &["question"]),
+            json!({"question": {"type": "string"}}),
+            &["question"]
+        ),
     ])
 }
 
@@ -84,9 +108,7 @@ impl Server {
                 Err(e) => json!({"jsonrpc": "2.0", "id": id,
                     "error": {"code": -32603, "message": format!("{e:#}")}}),
             };
-            stdout
-                .write_all(format!("{resp}\n").as_bytes())
-                .await?;
+            stdout.write_all(format!("{resp}\n").as_bytes()).await?;
             stdout.flush().await?;
         }
         Ok(())
@@ -129,8 +151,12 @@ impl Server {
         match name {
             "get_brief" => Ok(codemap::build(&self.root)?.brief()),
             "symbol_info" => Ok(codemap::build(&self.root)?.detail(&s("name"))),
-            "callers" => Ok(codemap::build(&self.root)?.callers_of(&s("name")).join("\n")),
-            "callees" => Ok(codemap::build(&self.root)?.callees_of(&s("name")).join("\n")),
+            "callers" => Ok(codemap::build(&self.root)?
+                .callers_of(&s("name"))
+                .join("\n")),
+            "callees" => Ok(codemap::build(&self.root)?
+                .callees_of(&s("name"))
+                .join("\n")),
             "best_practices" => Ok(practices::relevant_sections(&s("topic"))),
             "helpers" => {
                 let list = helpers::load_cache(&self.root)

@@ -90,10 +90,7 @@ impl Orchestrator {
 
             let report = self.cratchit_execute(task, &plan).await?;
             eprintln!("--- cratchit report ---\n{report}\n");
-            scrooge_log.push(Message::text(
-                "user",
-                format!("CRATCHIT REPORT:\n{report}"),
-            ));
+            scrooge_log.push(Message::text("user", format!("CRATCHIT REPORT:\n{report}")));
         }
         Ok("round limit reached without DONE; review output above".into())
     }
@@ -111,8 +108,11 @@ impl Orchestrator {
 
     /// One-shot question for the cheap model with full tool access.
     pub async fn ask(&mut self, question: &str) -> Result<String> {
-        self.cratchit_execute(question, "Answer the question directly; investigate with tools first.")
-            .await
+        self.cratchit_execute(
+            question,
+            "Answer the question directly; investigate with tools first.",
+        )
+        .await
     }
 
     /// Cratchit reviews heuristic helper candidates and keeps only genuinely
@@ -152,7 +152,9 @@ impl Orchestrator {
                 }
                 let text = msg.content.unwrap_or_default();
                 for line in text.lines() {
-                    let Some(rest) = line.trim().strip_prefix("KEEP ") else { continue };
+                    let Some(rest) = line.trim().strip_prefix("KEEP ") else {
+                        continue;
+                    };
                     let (name, purpose) = rest.split_once('|').unwrap_or((rest, ""));
                     let name = name.trim();
                     if let Some(h) = batch.iter().find(|h| h.name == name) {
@@ -189,7 +191,10 @@ impl Orchestrator {
             for call in calls {
                 let args: Value =
                     serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
-                eprintln!("  [cratchit] {}({})", call.function.name, call.function.arguments);
+                eprintln!(
+                    "  [cratchit] {}({})",
+                    call.function.name, call.function.arguments
+                );
                 let out = self.toolbox.call(&call.function.name, &args).await;
                 log.push(Message::tool_result(&call.id, out));
             }

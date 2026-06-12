@@ -1,7 +1,8 @@
 mod agents;
+mod checks;
 mod codemap;
-mod mcp;
 mod helpers;
+mod mcp;
 mod openrouter;
 mod practices;
 mod tools;
@@ -41,6 +42,10 @@ enum Cmd {
     McpServe,
     /// Print best-practice sections matching the given text (for hooks).
     Practices { text: String },
+    /// Run the post-task verification pass: autoformat, tests, lint autofix.
+    /// Commands come from .scrooge/checks.toml (created with per-language
+    /// defaults on first run). Exit code: 0 clean, 1 errors, 2 warnings.
+    Check,
     /// Find generic utility/helper functions in the repo (and dependencies
     /// with --deps), so agents reuse instead of reinventing. Results are
     /// cached in .scrooge/helpers.json and served by the `helpers` tool.
@@ -61,18 +66,34 @@ async fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Map => print!("{}", codemap::build(&root)?.brief()),
         Cmd::Sym { name } => print!("{}", codemap::build(&root)?.detail(&name)),
-        Cmd::Callers { name } => println!("{}", codemap::build(&root)?.callers_of(&name).join("\n")),
-        Cmd::Callees { name } => println!("{}", codemap::build(&root)?.callees_of(&name).join("\n")),
+        Cmd::Callers { name } => {
+            println!("{}", codemap::build(&root)?.callers_of(&name).join("\n"))
+        }
+        Cmd::Callees { name } => {
+            println!("{}", codemap::build(&root)?.callees_of(&name).join("\n"))
+        }
         Cmd::Run { task } => {
             let mut orch = agents::Orchestrator::new(root)?;
             println!("{}", orch.run_task(&task).await?);
         }
         Cmd::McpServe => mcp::Server::new(root).run().await?,
         Cmd::Practices { text } => print!("{}", practices::relevant_sections(&text)),
+        Cmd::Check => {
+            let report = checks::run(&root)?;
+            print!("{}", checks::render(&report));
+            if !report.errors.is_empty() {
+                std::process::exit(1);
+            }
+            if !report.warnings.is_empty() {
+                std::process::exit(2);
+            }
+        }
         Cmd::Helpers { deps, validate } => {
             let mut list = helpers::repo_helpers(&root)?;
             if deps {
-                eprintln!("scanning dependencies (cargo registry / site-packages / node_modules)...");
+                eprintln!(
+                    "scanning dependencies (cargo registry / site-packages / node_modules)..."
+                );
                 list.extend(helpers::dep_helpers(&root)?);
             }
             eprintln!("{} heuristic candidates", list.len());

@@ -29,11 +29,46 @@ pub struct Helper {
 
 /// Name fragments that smell like a generic utility.
 const UTIL_NAMES: &[&str] = &[
-    "is_", "has_", "to_", "from_", "parse", "format", "norm", "escape", "unescape",
-    "trim", "split", "join_", "merge", "convert", "encode", "decode", "clamp",
-    "strip", "slug", "camel", "snake", "kebab", "dedup", "flatten", "chunk",
-    "retry", "memo", "truncat", "sanitize", "valid", "util", "helper", "wrap_",
-    "uniq", "deep_", "pluck", "pad_", "capitalize", "pluralize", "slugify",
+    "is_",
+    "has_",
+    "to_",
+    "from_",
+    "parse",
+    "format",
+    "norm",
+    "escape",
+    "unescape",
+    "trim",
+    "split",
+    "join_",
+    "merge",
+    "convert",
+    "encode",
+    "decode",
+    "clamp",
+    "strip",
+    "slug",
+    "camel",
+    "snake",
+    "kebab",
+    "dedup",
+    "flatten",
+    "chunk",
+    "retry",
+    "memo",
+    "truncat",
+    "sanitize",
+    "valid",
+    "util",
+    "helper",
+    "wrap_",
+    "uniq",
+    "deep_",
+    "pluck",
+    "pad_",
+    "capitalize",
+    "pluralize",
+    "slugify",
 ];
 
 const MAX_HELPER_LINES: usize = 100;
@@ -57,7 +92,9 @@ fn score_map(origin: &str, map: &CodeMap, base: &Path, public_only: bool) -> Vec
         .collect();
     let mut fan_in: BTreeMap<&str, BTreeSet<&Path>> = BTreeMap::new();
     for (caller, callees) in &map.calls {
-        let Some(cf) = file_of.get(caller.as_str()) else { continue };
+        let Some(cf) = file_of.get(caller.as_str()) else {
+            continue;
+        };
         for callee in callees {
             fan_in.entry(callee).or_default().insert(cf);
         }
@@ -82,7 +119,11 @@ fn score_map(origin: &str, map: &CodeMap, base: &Path, public_only: bool) -> Vec
         }
         let files = fan_in.get(s.name.as_str()).map(|f| f.len()).unwrap_or(0);
         // Single-file usage is not evidence of genericity — only cross-file is.
-        let cross = if files >= 2 { (files.min(5) as u32) * 2 } else { 0 };
+        let cross = if files >= 2 {
+            (files.min(5) as u32) * 2
+        } else {
+            0
+        };
         let score = cross + name_score(&s.name);
         // Keep if used across files OR clearly utility-named.
         if score < 2 {
@@ -116,7 +157,9 @@ pub fn dep_helpers(root: &Path) -> Result<Vec<Helper>> {
 
     let mut out = Vec::new();
     for (name, dir) in deps {
-        let Ok(map) = codemap::build_limited(&dir, MAX_FILES_PER_DEP) else { continue };
+        let Ok(map) = codemap::build_limited(&dir, MAX_FILES_PER_DEP) else {
+            continue;
+        };
         let mut helpers = score_map(&name, &map, &dir, true);
         helpers.truncate(MAX_HELPERS_PER_DEP);
         out.extend(helpers);
@@ -150,7 +193,10 @@ fn rust_deps(root: &Path) -> Result<Vec<(String, PathBuf)>> {
         else {
             continue;
         };
-        let src = Path::new(manifest).parent().unwrap_or(Path::new("/")).join("src");
+        let src = Path::new(manifest)
+            .parent()
+            .unwrap_or(Path::new("/"))
+            .join("src");
         if src.is_dir() {
             deps.push((name.to_string(), src));
         }
@@ -176,24 +222,38 @@ fn python_deps(root: &Path) -> Vec<(String, PathBuf)> {
     let uses_python = root.join("requirements.txt").exists()
         || root.join("pyproject.toml").exists()
         || root.join("setup.py").exists();
-    if site_dirs.is_empty() && uses_python {
-        if let Ok(out) = std::process::Command::new("python3")
-            .args(["-c", "import site, json; print(json.dumps(site.getsitepackages()))"])
+    if site_dirs.is_empty()
+        && uses_python
+        && let Ok(out) = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import site, json; print(json.dumps(site.getsitepackages()))",
+            ])
             .output()
-        {
-            if let Ok(v) = serde_json::from_slice::<Vec<String>>(&out.stdout) {
-                site_dirs.extend(v.into_iter().map(PathBuf::from));
-            }
-        }
+        && let Ok(v) = serde_json::from_slice::<Vec<String>>(&out.stdout)
+    {
+        site_dirs.extend(v.into_iter().map(PathBuf::from));
     }
-    let skip = ["pip", "setuptools", "wheel", "pkg_resources", "_distutils_hack"];
+    let skip = [
+        "pip",
+        "setuptools",
+        "wheel",
+        "pkg_resources",
+        "_distutils_hack",
+    ];
     let mut deps = Vec::new();
     for sp in site_dirs {
-        let Ok(entries) = std::fs::read_dir(&sp) else { continue };
+        let Ok(entries) = std::fs::read_dir(&sp) else {
+            continue;
+        };
         for e in entries.flatten() {
             let p = e.path();
-            let Some(name) = p.file_name().and_then(|n| n.to_str()) else { continue };
-            if !p.is_dir() || name.contains("dist-info") || name.starts_with('_')
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !p.is_dir()
+                || name.contains("dist-info")
+                || name.starts_with('_')
                 || skip.contains(&name)
             {
                 continue;
@@ -208,20 +268,24 @@ fn python_deps(root: &Path) -> Vec<(String, PathBuf)> {
 fn js_deps(root: &Path) -> Vec<(String, PathBuf)> {
     let nm = root.join("node_modules");
     let mut deps = Vec::new();
-    let Ok(entries) = std::fs::read_dir(&nm) else { return deps };
+    let Ok(entries) = std::fs::read_dir(&nm) else {
+        return deps;
+    };
     for e in entries.flatten() {
         let p = e.path();
-        let Some(name) = p.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
         if !p.is_dir() || name == ".bin" {
             continue;
         }
         if let Some(scope) = name.strip_prefix('@') {
             if let Ok(inner) = std::fs::read_dir(&p) {
                 for s in inner.flatten() {
-                    if let Some(sub) = s.path().file_name().and_then(|n| n.to_str()) {
-                        if s.path().is_dir() {
-                            deps.push((format!("@{scope}/{sub}"), s.path()));
-                        }
+                    if let Some(sub) = s.path().file_name().and_then(|n| n.to_str())
+                        && s.path().is_dir()
+                    {
+                        deps.push((format!("@{scope}/{sub}"), s.path()));
                     }
                 }
             }
