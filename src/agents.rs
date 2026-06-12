@@ -32,8 +32,13 @@ python or wolfram tool can do it deterministically.\n\
 not whole files.\n\
 3. Call query_docs before using any API you are not 100% sure about.\n\
 4. Call best_practices with topic keywords before writing code.\n\
-5. Verify your work (compile, run, test) before reporting.\n\
-6. Your final message is a report for Scrooge: maximum 6 lines, only facts he \
+5. When a task needs an external library and none was named, call \
+search_libraries to find the current best option — never pick one from \
+memory. Then add it with add_dependency, which installs the LATEST published \
+version. Never write a version number into a manifest from memory — your \
+training data is stale.\n\
+6. Verify your work (compile, run, test) before reporting.\n\
+7. Your final message is a report for Scrooge: maximum 6 lines, only facts he \
 needs (what changed, file:line, verification result, blockers). No pleasantries, \
 no restating the plan, no code unless a decision depends on it.";
 
@@ -48,7 +53,7 @@ pub struct Orchestrator {
 impl Orchestrator {
     pub fn new(root: PathBuf) -> Result<Self> {
         Ok(Orchestrator {
-            client: Client::new()?,
+            client: Client::new(root.clone())?,
             toolbox: Toolbox::new(root),
             cheap_model: std::env::var("CRATCHIT_MODEL").unwrap_or(DEV_MODEL_CHEAP.into()),
             sota_model: std::env::var("SCROOGE_MODEL").unwrap_or(DEV_MODEL_SOTA.into()),
@@ -74,7 +79,7 @@ impl Orchestrator {
         for round in 1..=self.max_rounds {
             let plan_msg = self
                 .client
-                .chat(&self.sota_model, &scrooge_log, &[])
+                .chat("scrooge", &self.sota_model, &scrooge_log, &[])
                 .await?;
             let plan = plan_msg.content.clone().unwrap_or_default();
             scrooge_log.push(plan_msg);
@@ -139,7 +144,10 @@ impl Orchestrator {
                 Message::text("user", format!("CANDIDATES:\n{listing}")),
             ];
             for _ in 0..20 {
-                let msg = self.client.chat(&self.cheap_model, &log, &defs).await?;
+                let msg = self
+                    .client
+                    .chat("cratchit", &self.cheap_model, &log, &defs)
+                    .await?;
                 log.push(msg.clone());
                 if let Some(calls) = msg.tool_calls.filter(|c| !c.is_empty()) {
                     for call in calls {
@@ -183,7 +191,10 @@ impl Orchestrator {
         ];
         // Tool loop, capped to keep the cheap model from wandering.
         for _ in 0..40 {
-            let msg = self.client.chat(&self.cheap_model, &log, &defs).await?;
+            let msg = self
+                .client
+                .chat("cratchit", &self.cheap_model, &log, &defs)
+                .await?;
             log.push(msg.clone());
             let Some(calls) = msg.tool_calls.filter(|c| !c.is_empty()) else {
                 return Ok(msg.content.unwrap_or_default());

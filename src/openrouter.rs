@@ -3,6 +3,9 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::PathBuf;
+
+use crate::accounting;
 
 pub const DEV_MODEL_CHEAP: &str = "deepseek/deepseek-v4-flash"; // cratchit
 pub const DEV_MODEL_SOTA: &str = "deepseek/deepseek-v4-flash"; // scrooge (swap before real use)
@@ -60,23 +63,27 @@ pub struct Usage {
 pub struct Client {
     http: reqwest::Client,
     api_key: String,
+    root: PathBuf,
     pub usage: Usage,
 }
 
 impl Client {
-    pub fn new() -> Result<Self> {
+    pub fn new(root: PathBuf) -> Result<Self> {
         let api_key =
             std::env::var("OPENROUTER_API_KEY").context("OPENROUTER_API_KEY is not set")?;
         Ok(Client {
             http: reqwest::Client::new(),
             api_key,
+            root,
             usage: Usage::default(),
         })
     }
 
-    /// One chat completion. `tools` is an OpenAI-format tool list or empty.
+    /// One chat completion. `agent` ("scrooge"/"cratchit") attributes the
+    /// tokens in the ledger. `tools` is an OpenAI-format tool list or empty.
     pub async fn chat(
         &mut self,
+        agent: &str,
         model: &str,
         messages: &[Message],
         tools: &[Value],
@@ -103,8 +110,13 @@ impl Client {
             bail!("openrouter error {status}: {v}");
         }
         if let Some(u) = v.get("usage") {
-            self.usage.prompt_tokens += u["prompt_tokens"].as_u64().unwrap_or(0);
-            self.usage.completion_tokens += u["completion_tokens"].as_u64().unwrap_or(0);
+            let (p, c) = (
+                u["prompt_tokens"].as_u64().unwrap_or(0),
+                u["completion_tokens"].as_u64().unwrap_or(0),
+            );
+            self.usage.prompt_tokens += p;
+            self.usage.completion_tokens += c;
+            accounting::record(&self.root, agent, model, p, c);
         }
         let msg = v["choices"][0]["message"].clone();
         if msg.is_null() {

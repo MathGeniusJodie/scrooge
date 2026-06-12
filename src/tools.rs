@@ -107,6 +107,22 @@ pub fn definitions() -> Vec<Value> {
             ),
         ),
         tool(
+            "search_libraries",
+            "Web-search for the best external library for a need (Brave Search). ALWAYS call this before add_dependency when you need a library you weren't explicitly told to use — do not pick one from memory. Returns titles, URLs and snippets to compare candidates.",
+            obj(
+                json!({"query": {"type": "string", "description": "what you need, e.g. 'rust crate for parsing TOML', 'python library async http client'"}}),
+                &["query"],
+            ),
+        ),
+        tool(
+            "add_dependency",
+            "Add a package dependency at its latest published version (rust: cargo add; python: pip install -U; js: npm install @latest). ALWAYS use this instead of writing version numbers into manifests yourself — versions you remember are stale.",
+            obj(
+                json!({"lang": {"type": "string", "enum": ["python", "rust", "js"]}, "package": {"type": "string"}, "dev": {"type": "boolean", "description": "dev-dependency, optional"}}),
+                &["lang", "package"],
+            ),
+        ),
+        tool(
             "best_practices",
             "Fetch only the best-practice sections relevant to the given topic keywords.",
             obj(json!({"topic": {"type": "string"}}), &["topic"]),
@@ -226,6 +242,11 @@ impl Toolbox {
                 Ok(crate::helpers::render(&filtered))
             }
             "query_docs" => self.query_docs(&s("lang"), &s("query")).await,
+            "search_libraries" => web_search(&s("query")).await,
+            "add_dependency" => {
+                let dev = args["dev"].as_bool().unwrap_or(false);
+                self.add_dependency(&s("lang"), &s("package"), dev).await
+            }
             "best_practices" => Ok(practices::relevant_sections(&s("topic"))),
             _ => anyhow::bail!("unknown tool {name}"),
         }
@@ -253,6 +274,36 @@ impl Toolbox {
         Ok(s)
     }
 
+    async fn add_dependency(&self, lang: &str, package: &str, dev: bool) -> Result<String> {
+        match lang {
+            "rust" => {
+                // `cargo add` without a version resolves the latest from crates.io
+                // and pins it in Cargo.toml; its stderr names the chosen version.
+                let mut args = vec!["add", package];
+                if dev {
+                    args.push("--dev");
+                }
+                self.run("cargo", &args).await
+            }
+            "python" => {
+                self.run(
+                    "python3",
+                    &["-m", "pip", "install", "--upgrade", package],
+                )
+                .await
+            }
+            "js" => {
+                let spec = format!("{package}@latest");
+                let mut args = vec!["install", spec.as_str()];
+                if dev {
+                    args.push("--save-dev");
+                }
+                self.run("npm", &args).await
+            }
+            _ => anyhow::bail!("unsupported lang {lang}"),
+        }
+    }
+
     async fn query_docs(&self, lang: &str, query: &str) -> Result<String> {
         match lang {
             "python" => self.run("python3", &["-m", "pydoc", query]).await,
@@ -277,6 +328,40 @@ impl Toolbox {
             _ => anyhow::bail!("unsupported lang {lang}"),
         }
     }
+}
+
+async fn web_search(query: &str) -> Result<String> {
+    let key = std::env::var("BRAVE_SEARCH_KEY")
+        .map_err(|_| anyhow::anyhow!("BRAVE_SEARCH_KEY is not set"))?;
+    let body: Value = reqwest::Client::new()
+        .get("https://api.search.brave.com/res/v1/web/search")
+        .query(&[("q", query), ("count", "8")])
+        .header("X-Subscription-Token", key)
+        .header("Accept", "application/json")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let results = body["web"]["results"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if results.is_empty() {
+        return Ok("no results".into());
+    }
+    Ok(results
+        .iter()
+        .map(|r| {
+            format!(
+                "{}\n  {}\n  {}",
+                r["title"].as_str().unwrap_or(""),
+                r["url"].as_str().unwrap_or(""),
+                r["description"].as_str().unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 async fn fetch_text(url: &str) -> Result<String> {
