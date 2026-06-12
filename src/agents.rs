@@ -92,9 +92,7 @@ impl Orchestrator {
         let brief = codemap::build(&self.toolbox.root)?.brief();
         let guidance = practices::summary(task);
 
-        let intro = format!(
-            "TASK: {task}\n\nCODEBASE BRIEF:\n{brief}\nKEY GUIDANCE:\n{guidance}"
-        );
+        let intro = format!("TASK: {task}\n\nCODEBASE BRIEF:\n{brief}\nKEY GUIDANCE:\n{guidance}");
         let mut digests: Vec<String> = Vec::new();
         let mut last_plan: Option<String> = None;
         let mut last_report: Option<String> = None;
@@ -163,7 +161,10 @@ impl Orchestrator {
                     report.push_str(&format!("\nCHECKS: FAILING\n{rendered}"));
                     break;
                 }
-                eprintln!("--- checks failed (cratchit retry {}) ---\n{rendered}", attempt + 1);
+                eprintln!(
+                    "--- checks failed (cratchit retry {}) ---\n{rendered}",
+                    attempt + 1
+                );
                 report = self
                     .cratchit_execute(
                         task,

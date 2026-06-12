@@ -42,8 +42,6 @@ pub struct Symbol {
     pub file: PathBuf,
     pub line: usize,
     pub end_line: usize,
-    /// Enclosing class/impl name, if any.
-    pub parent: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -274,7 +272,6 @@ fn walk(
             file: rel.to_path_buf(),
             line: node.start_position().row + 1,
             end_line: node.end_position().row + 1,
-            parent: parent.map(|s| s.to_string()),
         });
         if is_container {
             new_parent = Some(name);
@@ -292,7 +289,6 @@ fn walk(
             file: rel.to_path_buf(),
             line: node.start_position().row + 1,
             end_line: node.end_position().row + 1,
-            parent: parent.map(|s| s.to_string()),
         });
         collect_calls(map, bytes, node, lang, &name);
     }

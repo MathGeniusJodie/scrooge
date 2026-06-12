@@ -13,7 +13,10 @@ pub fn record(root: &Path, agent: &str, model: &str, prompt: u64, completion: u6
         .append(true)
         .open(root.join("accounts.log"))
     {
-        let _ = writeln!(f, "{ts} {agent} {model} prompt={prompt} completion={completion}");
+        let _ = writeln!(
+            f,
+            "{ts} {agent} {model} prompt={prompt} completion={completion}"
+        );
     }
 
     let path = root.join("ledger.json");
@@ -49,7 +52,10 @@ mod tests {
         assert_eq!(ledger["cratchit"]["completion_tokens"], 15);
         assert_eq!(ledger["scrooge"]["prompt_tokens"], 7);
         assert_eq!(
-            std::fs::read_to_string(dir.join("accounts.log")).unwrap().lines().count(),
+            std::fs::read_to_string(dir.join("accounts.log"))
+                .unwrap()
+                .lines()
+                .count(),
             3
         );
         std::fs::remove_dir_all(&dir).unwrap();

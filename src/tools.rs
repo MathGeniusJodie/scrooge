@@ -270,7 +270,8 @@ impl Toolbox {
                         match fuzzy_match_ranges(&content, &find).as_slice() {
                             [] => anyhow::bail!("string not found in {}", path.display()),
                             [(a, b)] => {
-                                let new = format!("{}{}{}", &content[..*a], s("replace"), &content[*b..]);
+                                let new =
+                                    format!("{}{}{}", &content[..*a], s("replace"), &content[*b..]);
                                 std::fs::write(&path, new)?;
                                 Ok("edited (whitespace-tolerant match)".into())
                             }
@@ -365,12 +366,9 @@ impl Toolbox {
                 Ok(())
             });
         }
-        let out = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            cmd.output(),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out after 60s"))??;
+        let out = tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output())
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out after 60s"))??;
         let mut s = String::from_utf8_lossy(&out.stdout).to_string();
         let err = String::from_utf8_lossy(&out.stderr);
         if !err.trim().is_empty() {
@@ -457,8 +455,7 @@ mod sandbox {
     /// caches that `cargo`/`npm`/`pip` need to function.
     pub fn confine(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let abi = ABI::V2;
-        let mut writable: Vec<PathBuf> =
-            vec![root.to_path_buf(), "/tmp".into(), "/dev".into()];
+        let mut writable: Vec<PathBuf> = vec![root.to_path_buf(), "/tmp".into(), "/dev".into()];
         if let Ok(home) = std::env::var("HOME") {
             for d in [".cargo", ".npm", ".cache"] {
                 writable.push(Path::new(&home).join(d));
@@ -472,60 +469,6 @@ mod sandbox {
             .add_rules(path_beneath_rules(&writable, AccessFs::from_all(abi)))?
             .restrict_self()?;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn toolbox() -> Toolbox {
-        let root = std::env::temp_dir().join(format!("scrooge-sbx-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        Toolbox::new(root)
-    }
-
-    #[tokio::test]
-    async fn shell_write_inside_root_allowed() {
-        let tb = toolbox();
-        let out = tb
-            .call("shell", &json!({"command": "echo hi > inside.txt && cat inside.txt"}))
-            .await;
-        assert!(out.contains("hi"), "unexpected: {out}");
-    }
-
-    #[tokio::test]
-    async fn shell_write_outside_root_denied() {
-        let tb = toolbox();
-        let target = format!("{}/scrooge-landlock-escape", std::env::var("HOME").unwrap());
-        let out = tb
-            .call("shell", &json!({"command": format!("echo pwned > {target}")}))
-            .await;
-        assert!(
-            !std::path::Path::new(&target).exists(),
-            "sandbox escape: wrote {target}"
-        );
-        assert!(out.contains("[exit"), "expected failure, got: {out}");
-    }
-
-    #[test]
-    fn fuzzy_match_ignores_indentation() {
-        let content = "fn a() {\n    let x = 1;\n    let y = 2;\n}\n";
-        let find = "let x = 1;\nlet y = 2;";
-        let ranges = fuzzy_match_ranges(content, find);
-        assert_eq!(ranges.len(), 1);
-        let (a, b) = ranges[0];
-        assert_eq!(&content[a..b], "    let x = 1;\n    let y = 2;");
-        assert!(fuzzy_match_ranges(content, "let z = 3;").is_empty());
-    }
-
-    #[tokio::test]
-    async fn write_file_outside_root_denied() {
-        let tb = toolbox();
-        let out = tb
-            .call("write_file", &json!({"path": "../escape.txt", "content": "x"}))
-            .await;
-        assert!(out.contains("denied"), "unexpected: {out}");
     }
 }
 
@@ -577,4 +520,67 @@ async fn fetch_text(url: &str) -> Result<String> {
     let no_tags = regex::Regex::new(r"<[^>]+>")?.replace_all(&no_script, " ");
     let collapsed = regex::Regex::new(r"\s+")?.replace_all(&no_tags, " ");
     Ok(collapsed.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn toolbox() -> Toolbox {
+        let root = std::env::temp_dir().join(format!("scrooge-sbx-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        Toolbox::new(root)
+    }
+
+    #[tokio::test]
+    async fn shell_write_inside_root_allowed() {
+        let tb = toolbox();
+        let out = tb
+            .call(
+                "shell",
+                &json!({"command": "echo hi > inside.txt && cat inside.txt"}),
+            )
+            .await;
+        assert!(out.contains("hi"), "unexpected: {out}");
+    }
+
+    #[tokio::test]
+    async fn shell_write_outside_root_denied() {
+        let tb = toolbox();
+        let target = format!("{}/scrooge-landlock-escape", std::env::var("HOME").unwrap());
+        let out = tb
+            .call(
+                "shell",
+                &json!({"command": format!("echo pwned > {target}")}),
+            )
+            .await;
+        assert!(
+            !std::path::Path::new(&target).exists(),
+            "sandbox escape: wrote {target}"
+        );
+        assert!(out.contains("[exit"), "expected failure, got: {out}");
+    }
+
+    #[test]
+    fn fuzzy_match_ignores_indentation() {
+        let content = "fn a() {\n    let x = 1;\n    let y = 2;\n}\n";
+        let find = "let x = 1;\nlet y = 2;";
+        let ranges = fuzzy_match_ranges(content, find);
+        assert_eq!(ranges.len(), 1);
+        let (a, b) = ranges[0];
+        assert_eq!(&content[a..b], "    let x = 1;\n    let y = 2;");
+        assert!(fuzzy_match_ranges(content, "let z = 3;").is_empty());
+    }
+
+    #[tokio::test]
+    async fn write_file_outside_root_denied() {
+        let tb = toolbox();
+        let out = tb
+            .call(
+                "write_file",
+                &json!({"path": "../escape.txt", "content": "x"}),
+            )
+            .await;
+        assert!(out.contains("denied"), "unexpected: {out}");
+    }
 }
