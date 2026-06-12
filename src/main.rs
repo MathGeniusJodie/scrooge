@@ -5,6 +5,7 @@ mod codemap;
 mod helpers;
 mod mcp;
 mod openrouter;
+mod overview;
 mod practices;
 mod tools;
 

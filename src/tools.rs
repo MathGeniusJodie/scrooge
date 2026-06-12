@@ -225,6 +225,16 @@ fn edit_echo(content: &str, at: usize, len: usize) -> String {
         .join("\n")
 }
 
+/// Empty tool results read as silence to a cheap model (it retries or
+/// hallucinates); say "none found" explicitly instead.
+pub fn or_none(s: String) -> String {
+    if s.trim().is_empty() {
+        "none found".into()
+    } else {
+        s
+    }
+}
+
 /// "syntax OK" or a warning naming the first bad line, per tree-sitter.
 fn syntax_verdict(path: &Path, src: &str) -> String {
     match codemap::syntax_error_line(path, src) {
@@ -304,7 +314,13 @@ impl Toolbox {
                             .map(|(i, l)| format!("{}|{l}", i + 1))
                             .collect::<Vec<_>>()
                             .join("\n");
-                        if capped < wanted && capped < content.lines().count() {
+                        let total = content.lines().count();
+                        if out.is_empty() {
+                            out = format!(
+                                "no lines in range {a}-{} — file has {total} lines",
+                                if wanted == usize::MAX { total } else { wanted }
+                            );
+                        } else if capped < wanted && capped < total {
                             out.push_str(&format!(
                                 "\n[range clamped to {MAX_RANGE_LINES} lines; \
                                  request another range to continue]"
@@ -350,11 +366,11 @@ impl Toolbox {
             "symbol_info" => Ok(codemap::build_cached(&self.root)?.detail(&s("name"))),
             "callers" => {
                 let m = codemap::build_cached(&self.root)?;
-                Ok(m.callers_of(&s("name")).join("\n"))
+                Ok(or_none(m.callers_of(&s("name")).join("\n")))
             }
             "callees" => {
                 let m = codemap::build_cached(&self.root)?;
-                Ok(m.callees_of(&s("name")).join("\n"))
+                Ok(or_none(m.callees_of(&s("name")).join("\n")))
             }
             "helpers" => crate::helpers::filtered_listing(&self.root, &s("filter")),
             "query_docs" => self.query_docs(&s("lang"), &s("query")).await,
@@ -403,11 +419,15 @@ impl Toolbox {
 
         let line_of = |content: &str, at: usize| content[..at].matches('\n').count() + 1;
         let mut notes = Vec::new();
-        let mut single_region: Option<(usize, usize)> = None;
+        // Region of the most recent single replacement — later edits can't
+        // shift it, so it is always valid to echo after the loop.
+        let mut last_region: Option<(usize, usize)> = None;
         for (i, e) in edits.iter().enumerate() {
             let n = i + 1;
-            match content.matches(&e.find).count() {
-                0 => match fuzzy_match_ranges(&content, &e.find).as_slice() {
+            let occurrences: Vec<usize> =
+                content.match_indices(&e.find).map(|(at, _)| at).collect();
+            match occurrences.as_slice() {
+                [] => match fuzzy_match_ranges(&content, &e.find).as_slice() {
                     [] => anyhow::bail!(
                         "edit {n}: string not found in {} — no edits applied",
                         path.display()
@@ -419,27 +439,33 @@ impl Toolbox {
                             "edit {n}: line {} (whitespace-tolerant)",
                             line_of(&content, a)
                         ));
-                        single_region = Some((a, e.replace.len()));
+                        last_region = Some((a, e.replace.len()));
                     }
                     m => anyhow::bail!(
                         "edit {n}: matches {} places ignoring whitespace — no edits applied",
                         m.len()
                     ),
                 },
-                1 => {
-                    let at = content.find(&e.find).unwrap_or(0);
-                    content = content.replacen(&e.find, &e.replace, 1);
+                [at] => {
+                    let at = *at;
+                    content = format!(
+                        "{}{}{}",
+                        &content[..at],
+                        e.replace,
+                        &content[at + e.find.len()..]
+                    );
                     notes.push(format!("edit {n}: line {}", line_of(&content, at)));
-                    single_region = Some((at, e.replace.len()));
+                    last_region = Some((at, e.replace.len()));
                 }
-                c if e.all => {
+                m if e.all => {
                     content = content.replace(&e.find, &e.replace);
-                    notes.push(format!("edit {n}: replaced {c} occurrences"));
-                    single_region = None;
+                    notes.push(format!("edit {n}: replaced {} occurrences", m.len()));
+                    last_region = None;
                 }
-                c => anyhow::bail!(
-                    "edit {n}: string appears {c} times; set replace_all or provide \
-                     more context — no edits applied"
+                m => anyhow::bail!(
+                    "edit {n}: string appears {} times; set replace_all or provide \
+                     more context — no edits applied",
+                    m.len()
                 ),
             }
         }
@@ -451,9 +477,7 @@ impl Toolbox {
             notes.join("; "),
             syntax_verdict(&path, &content)
         );
-        if edits.len() == 1
-            && let Some((at, len)) = single_region
-        {
+        if let Some((at, len)) = last_region {
             out.push('\n');
             out.push_str(&edit_echo(&content, at, len));
         }
@@ -498,17 +522,31 @@ impl Toolbox {
         if sym.end_line > lines.len() || sym.line == 0 {
             anyhow::bail!("stale span for '{name}' — file changed; retry");
         }
+        // `lines()` strips \r, so join with the file's own separator to keep
+        // CRLF files CRLF (and the byte offsets below honest).
+        let sep = if content.contains("\r\n") {
+            "\r\n"
+        } else {
+            "\n"
+        };
         let mut new_lines: Vec<&str> = lines[..sym.line - 1].to_vec();
-        let body = new_source.trim_end_matches('\n');
-        new_lines.extend(body.lines());
+        let body = new_source.trim_end_matches(['\n', '\r']);
+        let body_lines: Vec<&str> = body.lines().collect();
+        let body_len = body_lines.iter().map(|l| l.len()).sum::<usize>()
+            + body_lines.len().saturating_sub(1) * sep.len();
+        new_lines.extend(&body_lines);
         new_lines.extend(&lines[sym.end_line..]);
-        let mut new = new_lines.join("\n");
+        let mut new = new_lines.join(sep);
         if content.ends_with('\n') {
-            new.push('\n');
+            new.push_str(sep);
         }
         std::fs::write(&path, &new)?;
 
-        let at: usize = new.lines().take(sym.line - 1).map(|l| l.len() + 1).sum();
+        let at: usize = new
+            .lines()
+            .take(sym.line - 1)
+            .map(|l| l.len() + sep.len())
+            .sum();
         Ok(format!(
             "replaced {} ({}:{}-{}); {}\n{}",
             sym.name,
@@ -516,7 +554,7 @@ impl Toolbox {
             sym.line,
             sym.end_line,
             syntax_verdict(&path, &new),
-            edit_echo(&new, at, body.len())
+            edit_echo(&new, at, body_len)
         ))
     }
 

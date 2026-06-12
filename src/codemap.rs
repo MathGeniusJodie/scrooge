@@ -88,6 +88,22 @@ const SKIP_DIRS: &[&str] = &[
 
 const MAX_FILE_BYTES: u64 = 262_144;
 
+/// All indexable source files under `root`, skipping vendored/build dirs.
+/// Shared by `build_limited` and `cache_key` so the cache key and the build
+/// always agree on what counts as a source file.
+fn source_files(root: &Path) -> impl Iterator<Item = walkdir::DirEntry> {
+    WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|e| {
+            !e.file_name()
+                .to_str()
+                .map(|n| SKIP_DIRS.contains(&n))
+                .unwrap_or(false)
+        })
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file() && lang_for(e.path()).is_some())
+}
+
 pub fn build(root: &Path) -> Result<CodeMap> {
     build_limited(root, usize::MAX)
 }
@@ -97,17 +113,7 @@ pub fn build(root: &Path) -> Result<CodeMap> {
 pub fn build_limited(root: &Path, max_files: usize) -> Result<CodeMap> {
     let mut map = CodeMap::default();
     let mut seen = 0usize;
-    for entry in WalkDir::new(root)
-        .into_iter()
-        .filter_entry(|e| {
-            !e.file_name()
-                .to_str()
-                .map(|n| SKIP_DIRS.contains(&n))
-                .unwrap_or(false)
-        })
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-    {
+    for entry in source_files(root) {
         let path = entry.path();
         let Some(lang) = lang_for(path) else { continue };
         if entry
@@ -140,20 +146,7 @@ static CACHE: OnceLock<Mutex<Option<CacheEntry>>> = OnceLock::new();
 fn cache_key(root: &Path) -> (SystemTime, usize) {
     let mut newest = SystemTime::UNIX_EPOCH;
     let mut count = 0usize;
-    for entry in WalkDir::new(root)
-        .into_iter()
-        .filter_entry(|e| {
-            !e.file_name()
-                .to_str()
-                .map(|n| SKIP_DIRS.contains(&n))
-                .unwrap_or(false)
-        })
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-    {
-        if lang_for(entry.path()).is_none() {
-            continue;
-        }
+    for entry in source_files(root) {
         count += 1;
         if let Ok(meta) = entry.metadata()
             && let Ok(t) = meta.modified()

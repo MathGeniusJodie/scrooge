@@ -79,6 +79,15 @@ const MAX_FAIL_CHARS: usize = 600;
 /// rounds (round 1 always gets the full brief — Scrooge is planning then).
 const SLICE_BRIEF_OVER: usize = 4000;
 
+/// Largest char boundary <= `i`, so byte-budget truncation never panics on
+/// multibyte UTF-8 (reports and check output routinely contain `—`, `’`, …).
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 /// Clamp a Cratchit report to the size rule 7 promises.
 fn clamp_report(s: &str) -> String {
     let mut out = s
@@ -87,7 +96,7 @@ fn clamp_report(s: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     if out.len() > MAX_REPORT_CHARS {
-        out.truncate(MAX_REPORT_CHARS);
+        out.truncate(floor_char_boundary(&out, MAX_REPORT_CHARS));
         out.push_str("\n[report clamped]");
     } else if s.lines().count() > MAX_REPORT_LINES {
         out.push_str("\n[report clamped]");
@@ -123,13 +132,14 @@ fn plan_steps(plan: &str) -> Vec<String> {
 }
 
 /// Compress a multi-step report for Scrooge: completed intermediate steps
-/// shrink to their first lines plus the CHECKS verdict; the final (or
-/// failing) step stays full.
+/// shrink to their first lines plus the CHECKS verdict; the final step and
+/// any failing step stay full (a failing step may not be last — a "[steps
+/// skipped]" stub follows it).
 fn digest_steps(reports: &[String]) -> String {
     let mut out = Vec::new();
     for (i, r) in reports.iter().enumerate() {
         let lines: Vec<&str> = r.lines().collect();
-        if i + 1 == reports.len() || lines.len() <= 6 {
+        if i + 1 == reports.len() || lines.len() <= 6 || r.contains("CHECKS: FAILING") {
             out.push(r.clone());
         } else {
             out.push(format!(
@@ -174,13 +184,27 @@ fn evict_old_tool_results(log: &mut [Message]) {
     }
 }
 
+/// Short stderr preview of tool-call arguments — a full write_file body
+/// would make the log unreadable.
+fn arg_preview(args: &str) -> String {
+    const MAX: usize = 200;
+    if args.len() <= MAX {
+        return args.to_string();
+    }
+    format!(
+        "{}… [{} chars]",
+        &args[..floor_char_boundary(args, MAX)],
+        args.len()
+    )
+}
+
 /// Keep the tail of `s` (failure summaries end up at the bottom).
 fn tail(s: &str, max_chars: usize) -> String {
     let s = s.trim();
     if s.len() <= max_chars {
         return s.to_string();
     }
-    let cut = s.len() - max_chars;
+    let cut = floor_char_boundary(s, s.len() - max_chars);
     let cut = s[cut..].find('\n').map_or(cut, |i| cut + i + 1);
     format!("[...]\n{}", &s[cut..])
 }
@@ -197,7 +221,9 @@ fn worktree_changes(root: &Path) -> Option<String> {
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
     };
-    let diff = git(&["diff", "--stat"])?;
+    // Diff against HEAD so staged changes count too (Cratchit sometimes runs
+    // `git add`); fall back to the index diff on a repo with no commits yet.
+    let diff = git(&["diff", "HEAD", "--stat"]).or_else(|| git(&["diff", "--stat"]))?;
     let untracked = git(&["status", "--short", "--untracked-files"])
         .unwrap_or_default()
         .lines()
@@ -234,7 +260,10 @@ impl Orchestrator {
     /// earlier rounds + only the latest plan/report, so his prompt does not
     /// grow with superseded history.
     pub async fn run_task(&mut self, task: &str) -> Result<String> {
-        // Deterministic, zero-token context gathering.
+        // Deterministic, zero-token context gathering. The overview is the
+        // one piece Cratchit writes first if missing — what the project *is*
+        // can't be derived from the symbol map.
+        let overview = self.ensure_overview(task).await?;
         let map = codemap::build_cached(&self.toolbox.root)?;
         let full_brief = map.brief();
         let guidance = practices::summary(task);
@@ -258,7 +287,10 @@ impl Orchestrator {
                 Message::text("system", SCROOGE_SYSTEM),
                 Message::text(
                     "user",
-                    format!("TASK: {task}\n\nCODEBASE BRIEF:\n{brief}\nKEY GUIDANCE:\n{guidance}"),
+                    format!(
+                        "TASK: {task}\n\nPROJECT OVERVIEW:\n{overview}\n\n\
+                         CODEBASE BRIEF:\n{brief}\nKEY GUIDANCE:\n{guidance}"
+                    ),
                 ),
             ];
             if !digests.is_empty() {
@@ -293,49 +325,28 @@ impl Orchestrator {
             }
             eprintln!("--- scrooge (round {round}) ---\n{plan}\n");
 
-            if plan.trim().starts_with("DONE") {
-                if checks_clean == Some(false) {
-                    // The corrective step is fully determined — route it to
-                    // Cratchit instead of asking Scrooge to spell it out.
-                    let failures = last_report
-                        .as_deref()
-                        .and_then(|r| r.split("CHECKS: FAILING").nth(1))
-                        .unwrap_or("")
-                        .to_string();
-                    let prev = last_report.clone();
-                    let (report, verdict) = self
-                        .execute_and_verify(
-                            task,
-                            &format!(
-                                "The deterministic check suite is failing. Fix the \
-                                 failures below, then verify.\n{failures}"
-                            ),
-                            prev.as_deref(),
-                        )
-                        .await?;
-                    if let Some(c) = verdict {
-                        checks_clean = Some(c);
-                    }
+            // DONE is accepted only while checks are green. With red checks
+            // the corrective step is fully determined, so synthesize it and
+            // fall through to the normal execution path instead of burning a
+            // Scrooge round; the DONE ruling is honored once checks pass.
+            let done_pending = plan.trim().starts_with("DONE");
+            if done_pending {
+                if checks_clean != Some(false) {
+                    // A verdict only exists when files changed, so this
+                    // gates the overview review to tasks that wrote code.
                     if checks_clean == Some(true) {
-                        // Scrooge already ruled DONE pending green checks.
-                        let u = &self.client.usage;
-                        return Ok(format!(
-                            "task complete in {round} round(s). tokens: {} in / {} out",
-                            u.prompt_tokens, u.completion_tokens
-                        ));
+                        self.refresh_overview(task).await;
                     }
-                    digests.push(format!(
-                        "round {round}: DONE deferred, cratchit sent to fix checks"
-                    ));
-                    last_plan = Some(plan);
-                    last_report = Some(report);
-                    continue;
+                    return Ok(self.bill(round));
                 }
-                let u = &self.client.usage;
-                return Ok(format!(
-                    "task complete in {round} round(s). tokens: {} in / {} out",
-                    u.prompt_tokens, u.completion_tokens
-                ));
+                let failures = last_report
+                    .as_deref()
+                    .and_then(|r| r.split("CHECKS: FAILING").nth(1))
+                    .unwrap_or("");
+                plan = format!(
+                    "1. The deterministic check suite is failing. Fix the \
+                     failures below, then verify.\n{failures}"
+                );
             }
 
             // One fresh Cratchit per plan step, in order. Each step is
@@ -379,18 +390,119 @@ impl Orchestrator {
                     break;
                 }
             }
+            if done_pending && checks_clean == Some(true) {
+                // Scrooge already ruled DONE pending green checks.
+                self.refresh_overview(task).await;
+                return Ok(self.bill(round));
+            }
             let report = digest_steps(&step_reports);
             eprintln!("--- cratchit report ---\n{report}\n");
 
+            // Include the CHECKS verdict so Scrooge sees round-level
+            // pass/fail history at negligible cost.
+            let verdict = report
+                .lines()
+                .rev()
+                .find(|l| l.starts_with("CHECKS:"))
+                .unwrap_or("");
             digests.push(format!(
-                "round {round}: {} -> {}",
+                "round {round}: {} -> {} [{}]",
                 plan.lines().next().unwrap_or("").trim(),
-                report.lines().next().unwrap_or("").trim()
+                report.lines().next().unwrap_or("").trim(),
+                verdict
             ));
             last_plan = Some(plan);
             last_report = Some(report);
         }
         Ok("round limit reached without DONE; review output above".into())
+    }
+
+    /// Load .scrooge/overview.md, having Cratchit write it first if missing.
+    /// On a fresh project the kickoff task itself is the source; on an
+    /// existing codebase Cratchit explores with his tools — reading enough
+    /// files to characterize a codebase is exactly the token-heavy legwork
+    /// that must never land on Scrooge. The file stays user-editable and is
+    /// injected verbatim into every briefing from then on.
+    async fn ensure_overview(&mut self, task: &str) -> Result<String> {
+        let root = self.toolbox.root.clone();
+        if let Some(text) = crate::overview::load(&root) {
+            return Ok(text);
+        }
+        let fresh_project = codemap::build_cached(&root)?.symbols.is_empty();
+        let instructions = if fresh_project {
+            format!(
+                "This is a brand-new project being kicked off with this request:\n\
+                 {task}\n\n\
+                 Write the project overview that future planning will rely on. \
+                 First line: what the project is, in one sentence. Then one short \
+                 prose paragraph describing the intended architecture. Do not \
+                 modify any files. Your final message must be ONLY the overview \
+                 text, at most 15 lines — it is saved verbatim as overview.md."
+            )
+        } else {
+            "This codebase was built without an overview on file. Investigate it \
+             (README, manifests, entry points, key modules — read as much as you \
+             need) and write the project overview. First line: what the project \
+             is, in one sentence. Then one short prose paragraph describing the \
+             architecture and the design decisions/invariants that are NOT \
+             obvious from a symbol listing (data flow, why the pieces are split \
+             this way, what must stay true). Do not modify any files. Your final \
+             message must be ONLY the overview text, at most 15 lines — it is \
+             saved verbatim as overview.md."
+                .to_string()
+        };
+        eprintln!("--- no overview on file; cratchit is writing one ---");
+        let text = self.cratchit_execute(task, &instructions, None).await?;
+        let text = text.trim();
+        if text.is_empty() {
+            anyhow::bail!("cratchit produced an empty overview");
+        }
+        crate::overview::save(&root, text)?;
+        eprintln!(
+            "wrote {} (edit freely; it is sent with every briefing)",
+            crate::overview::path(&root).display()
+        );
+        Ok(text.to_string())
+    }
+
+    /// After a fulfilled task that wrote code, have Cratchit reconsider the
+    /// overview against the diff; he edits .scrooge/overview.md himself when
+    /// it has gone stale. Best-effort — a failure here must never tarnish a
+    /// task that already completed.
+    async fn refresh_overview(&mut self, task: &str) {
+        let root = self.toolbox.root.clone();
+        if crate::overview::load(&root).is_none() {
+            return; // nothing on file to go stale
+        }
+        let changed = worktree_changes(&root)
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| "(no diff available)".into());
+        // The current overview is already injected into the briefing by
+        // cratchit_execute, so the instructions only need the diff.
+        let instructions = format!(
+            "The task above is complete. Review the PROJECT OVERVIEW in your \
+             briefing against what changed:\n{changed}\n\n\
+             If the overview's description of purpose or architecture is now \
+             stale, rewrite .scrooge/overview.md (write_file or edit_file): \
+             first line — what the project is in one sentence, then one short \
+             prose paragraph on architecture and non-obvious invariants, at \
+             most 15 lines. If it is still accurate, change NOTHING. Report \
+             one line: 'overview updated: <what changed>' or 'overview \
+             unchanged'."
+        );
+        match self.cratchit_execute(task, &instructions, None).await {
+            Ok(report) => eprintln!("--- overview review ---\n{}", report.trim()),
+            Err(e) => eprintln!("[overview review failed (task still complete): {e:#}]"),
+        }
+    }
+
+    /// Completion banner with the cumulative token bill.
+    fn bill(&self, round: usize) -> String {
+        let u = &self.client.usage;
+        format!(
+            "task complete in {round} round(s). tokens: {} in / {} out",
+            u.prompt_tokens, u.completion_tokens
+        )
     }
 
     /// Execute instructions via Cratchit, then verify deterministically:
@@ -482,6 +594,9 @@ impl Orchestrator {
     /// token bill for this call only (usage accumulates across the server's
     /// lifetime).
     pub async fn delegate(&mut self, task: &str, instructions: &str) -> Result<String> {
+        // Same rule as the native loop: an overview exists before any work
+        // is planned against the codebase.
+        self.ensure_overview(task).await?;
         let before = (
             self.client.usage.prompt_tokens,
             self.client.usage.completion_tokens,
@@ -532,38 +647,71 @@ impl Orchestrator {
                 ),
                 Message::text("user", format!("CANDIDATES:\n{listing}")),
             ];
-            for _ in 0..20 {
-                let msg = self
-                    .client
-                    .chat("cratchit", &self.cheap_model, &log, &defs, None)
-                    .await?;
-                log.push(msg.clone());
-                if let Some(calls) = msg.tool_calls.filter(|c| !c.is_empty()) {
-                    for call in calls {
-                        let args: Value =
-                            serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
-                        let out = self.toolbox.call(&call.function.name, &args).await;
-                        log.push(Message::tool_result(&call.id, out));
-                    }
+            let text = match self.tool_loop(&mut log, &defs, 20).await? {
+                Some(text) => text,
+                None => {
+                    // Tool budget exhausted mid-batch: force a verdict rather
+                    // than silently dropping every candidate in the batch.
+                    log.push(Message::text(
+                        "user",
+                        "STOP: tool budget exhausted. Output your KEEP lines now, \
+                         nothing else. No tool calls.",
+                    ));
+                    self.client
+                        .chat("cratchit", &self.cheap_model, &log, &[], None)
+                        .await?
+                        .content
+                        .unwrap_or_default()
+                }
+            };
+            for line in text.lines() {
+                let Some(rest) = line.trim().strip_prefix("KEEP ") else {
                     continue;
+                };
+                let (name, purpose) = rest.split_once('|').unwrap_or((rest, ""));
+                let name = name.trim();
+                if let Some(h) = batch.iter().find(|h| h.name == name) {
+                    let mut h = h.clone();
+                    h.purpose = Some(purpose.trim().to_string());
+                    kept.push(h);
                 }
-                let text = msg.content.unwrap_or_default();
-                for line in text.lines() {
-                    let Some(rest) = line.trim().strip_prefix("KEEP ") else {
-                        continue;
-                    };
-                    let (name, purpose) = rest.split_once('|').unwrap_or((rest, ""));
-                    let name = name.trim();
-                    if let Some(h) = batch.iter().find(|h| h.name == name) {
-                        let mut h = h.clone();
-                        h.purpose = Some(purpose.trim().to_string());
-                        kept.push(h);
-                    }
-                }
-                break;
             }
         }
         Ok(kept)
+    }
+
+    /// Chat/tool loop shared by every Cratchit entry point: dispatch tool
+    /// calls (evicting stale results as the log grows) until the model
+    /// replies with text, or return None when `max_iters` is exhausted.
+    async fn tool_loop(
+        &mut self,
+        log: &mut Vec<Message>,
+        defs: &[Value],
+        max_iters: usize,
+    ) -> Result<Option<String>> {
+        for _ in 0..max_iters {
+            evict_old_tool_results(log);
+            let msg = self
+                .client
+                .chat("cratchit", &self.cheap_model, log, defs, None)
+                .await?;
+            log.push(msg.clone());
+            let Some(calls) = msg.tool_calls.filter(|c| !c.is_empty()) else {
+                return Ok(Some(msg.content.unwrap_or_default()));
+            };
+            for call in calls {
+                let args: Value =
+                    serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
+                eprintln!(
+                    "  [cratchit] {}({})",
+                    call.function.name,
+                    arg_preview(&call.function.arguments)
+                );
+                let out = self.toolbox.call(&call.function.name, &args).await;
+                log.push(Message::tool_result(&call.id, out));
+            }
+        }
+        Ok(None)
     }
 
     async fn cratchit_execute(
@@ -580,6 +728,11 @@ impl Orchestrator {
         let context = format!("{task} {plan}");
         let map = codemap::build_cached(&self.toolbox.root)?.brief_for(&context);
         let guidance = practices::relevant_sections(&context);
+        // Loaded, never generated, here — ensure_overview() itself runs
+        // through cratchit_execute, so generating would recurse.
+        let overview = crate::overview::load(&self.toolbox.root)
+            .map(|o| format!("\nPROJECT OVERVIEW:\n{o}\n"))
+            .unwrap_or_default();
         let prev = prev_report
             .map(|r| format!("\nPREVIOUS ROUND REPORT (already verified facts):\n{r}\n"))
             .unwrap_or_default();
@@ -588,7 +741,8 @@ impl Orchestrator {
             Message::text(
                 "user",
                 format!(
-                    "PROJECT ROOT: {}\nTASK: {task}\n\nSCROOGE'S INSTRUCTIONS:\n{plan}\n{prev}\n\
+                    "PROJECT ROOT: {}\nTASK: {task}\n{overview}\n\
+                     SCROOGE'S INSTRUCTIONS:\n{plan}\n{prev}\n\
                      CODE MAP (files mentioned in the instructions shown in full):\n{map}\n\
                      GUIDANCE:\n{guidance}",
                     self.toolbox.root.display()
@@ -596,26 +750,8 @@ impl Orchestrator {
             ),
         ];
         // Tool loop, capped to keep the cheap model from wandering.
-        for _ in 0..40 {
-            evict_old_tool_results(&mut log);
-            let msg = self
-                .client
-                .chat("cratchit", &self.cheap_model, &log, &defs, None)
-                .await?;
-            log.push(msg.clone());
-            let Some(calls) = msg.tool_calls.filter(|c| !c.is_empty()) else {
-                return Ok(msg.content.unwrap_or_default());
-            };
-            for call in calls {
-                let args: Value =
-                    serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
-                eprintln!(
-                    "  [cratchit] {}({})",
-                    call.function.name, call.function.arguments
-                );
-                let out = self.toolbox.call(&call.function.name, &args).await;
-                log.push(Message::tool_result(&call.id, out));
-            }
+        if let Some(text) = self.tool_loop(&mut log, &defs, 40).await? {
+            return Ok(text);
         }
         // Tool budget exhausted: force a final report deterministically so
         // Scrooge never pays a round to read "hit the limit".

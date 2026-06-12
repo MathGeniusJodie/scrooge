@@ -29,7 +29,7 @@ fn tool_list() -> Value {
     json!([
         tool(
             "get_brief",
-            "Compact codebase map: every file with its functions/classes/line numbers. Pass `about` (task keywords) to get a slice — only matching files in full, the rest as names. Never read source files directly — that's what Cratchit is for.",
+            "Project overview (what the codebase is and how it hangs together) plus a compact codebase map: every file with its functions/classes/line numbers. Pass `about` (task keywords) to slice the map — only matching files in full, the rest as names. Never read source files directly — that's what Cratchit is for.",
             json!({"about": {"type": "string", "description": "task keywords to slice the brief by, optional"}}),
             &[]
         ),
@@ -158,10 +158,16 @@ impl Server {
             "get_brief" => {
                 let map = codemap::build_cached(&self.root)?;
                 let about = s("about");
-                Ok(if about.is_empty() {
+                let brief = if about.is_empty() {
                     map.brief()
                 } else {
                     map.brief_for(&about)
+                };
+                // The prose overview rides on top of the symbol map; it is
+                // written by Cratchit on the first task if missing.
+                Ok(match crate::overview::load(&self.root) {
+                    Some(o) => format!("PROJECT OVERVIEW:\n{o}\n\n{brief}"),
+                    None => brief,
                 })
             }
             "run_checks" => {
@@ -171,12 +177,16 @@ impl Server {
                 Ok(crate::checks::render(&report))
             }
             "symbol_info" => Ok(codemap::build_cached(&self.root)?.detail(&s("name"))),
-            "callers" => Ok(codemap::build_cached(&self.root)?
-                .callers_of(&s("name"))
-                .join("\n")),
-            "callees" => Ok(codemap::build_cached(&self.root)?
-                .callees_of(&s("name"))
-                .join("\n")),
+            "callers" => Ok(crate::tools::or_none(
+                codemap::build_cached(&self.root)?
+                    .callers_of(&s("name"))
+                    .join("\n"),
+            )),
+            "callees" => Ok(crate::tools::or_none(
+                codemap::build_cached(&self.root)?
+                    .callees_of(&s("name"))
+                    .join("\n"),
+            )),
             "best_practices" => Ok(practices::relevant_sections(&s("topic"))),
             "helpers" => helpers::filtered_listing(&self.root, &s("filter")),
             "give_cratchit_task" => {

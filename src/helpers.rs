@@ -320,12 +320,20 @@ pub fn save_cache(root: &Path, helpers: &[Helper]) -> Result<()> {
 }
 
 /// The `helpers` tool body, shared by the toolbox and the MCP server:
-/// validated cache if present (full scans run via `scrooge helpers --deps`),
-/// repo-only scan otherwise, narrowed by an optional substring filter.
+/// validated cache entries (full scans run via `scrooge helpers --deps`)
+/// topped up with a fresh repo scan — so helpers written after the cache was
+/// built still show up — narrowed by an optional substring filter.
 pub fn filtered_listing(root: &Path, filter: &str) -> Result<String> {
-    let list = load_cache(root)
-        .map(Ok)
-        .unwrap_or_else(|| repo_helpers(root))?;
+    let mut list = load_cache(root).unwrap_or_default();
+    let known: BTreeSet<(String, String)> = list
+        .iter()
+        .map(|h| (h.name.clone(), h.file.clone()))
+        .collect();
+    list.extend(
+        repo_helpers(root)?
+            .into_iter()
+            .filter(|h| !known.contains(&(h.name.clone(), h.file.clone()))),
+    );
     let filter = filter.to_lowercase();
     let filtered: Vec<_> = list
         .into_iter()
@@ -339,6 +347,9 @@ pub fn filtered_listing(root: &Path, filter: &str) -> Result<String> {
                     .contains(&filter)
         })
         .collect();
+    if filtered.is_empty() {
+        return Ok("no matching helpers found".into());
+    }
     Ok(render(&filtered))
 }
 

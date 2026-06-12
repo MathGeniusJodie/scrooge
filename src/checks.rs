@@ -125,7 +125,12 @@ fn truncate(s: &str) -> String {
     if s.len() <= MAX_OUTPUT_CHARS {
         return s.to_string();
     }
-    let start = s.len() - MAX_OUTPUT_CHARS;
+    // Back off to a char boundary: tool output is full of multibyte
+    // punctuation (rustc’s quotes, arrows) and a mid-char slice panics.
+    let mut start = s.len() - MAX_OUTPUT_CHARS;
+    while !s.is_char_boundary(start) {
+        start -= 1;
+    }
     let start = s[start..].find('\n').map_or(start, |i| start + i + 1);
     format!("[... truncated ...]\n{}", &s[start..])
 }

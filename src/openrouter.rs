@@ -104,20 +104,44 @@ impl Client {
         if let Some(cap) = max_tokens {
             body["max_tokens"] = serde_json::json!(cap);
         }
-        let resp = self
-            .http
-            .post("https://openrouter.ai/api/v1/chat/completions")
-            .bearer_auth(&self.api_key)
-            .header("HTTP-Referer", "https://github.com/scrooge-agent")
-            .header("X-Title", "scrooge")
-            .json(&body)
-            .send()
-            .await?;
-        let status = resp.status();
-        let v: Value = resp.json().await.context("decoding openrouter response")?;
-        if !status.is_success() {
-            bail!("openrouter error {status}: {v}");
-        }
+        // Retry transient failures (429 / 5xx / transport errors) with
+        // backoff: one network blip must not discard a whole task's tokens.
+        const RETRIES: u32 = 3;
+        let mut attempt = 0;
+        let v: Value = loop {
+            attempt += 1;
+            let resp = self
+                .http
+                .post("https://openrouter.ai/api/v1/chat/completions")
+                .bearer_auth(&self.api_key)
+                .header("HTTP-Referer", "https://github.com/scrooge-agent")
+                .header("X-Title", "scrooge")
+                .json(&body)
+                .send()
+                .await;
+            match resp {
+                Ok(r) => {
+                    let status = r.status();
+                    // Read text before parsing so a non-JSON error page (e.g.
+                    // gateway HTML on a 502) still reports its status code.
+                    let text = r.text().await.unwrap_or_default();
+                    if status.is_success() {
+                        break serde_json::from_str(&text)
+                            .context("decoding openrouter response")?;
+                    }
+                    let transient = status.as_u16() == 429 || status.is_server_error();
+                    if !transient || attempt > RETRIES {
+                        bail!("openrouter error {status}: {text}");
+                    }
+                    eprintln!("[openrouter {status}; retry {attempt}/{RETRIES}]");
+                }
+                Err(e) if attempt <= RETRIES => {
+                    eprintln!("[openrouter transport error: {e}; retry {attempt}/{RETRIES}]");
+                }
+                Err(e) => return Err(e).context("openrouter request failed"),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
+        };
         if let Some(u) = v.get("usage") {
             let (p, c) = (
                 u["prompt_tokens"].as_u64().unwrap_or(0),
