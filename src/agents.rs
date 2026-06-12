@@ -28,6 +28,8 @@ You never read full files, never write code, and never use tools. You direct Cra
 a junior agent with full tool access (files, shell, python, wolfram, docs, call graph).\n\
 When given a task and a codebase brief, reply with a numbered plan of concrete steps \
 for Cratchit. Each step: one line, imperative, naming exact files/symbols where known. \
+Each numbered step is dispatched to a FRESH Cratchit in order, so every step must be \
+independently executable and verifiable; group work that belongs together into one step. \
 Every Cratchit report ends with machine-generated CHANGED (git diffstat) and CHECKS \
 (format/test/lint verdict) lines — trust those over Cratchit's own claims. When given \
 a progress report, reply either with corrections/next steps (same format) or the \
@@ -41,7 +43,8 @@ Rules:\n\
 1. Use tools for everything. NEVER do arithmetic or logic in your head when the \
 python or wolfram tool can do it deterministically.\n\
 2. Use the included code map; call symbol_info / callers before changing any \
-signature; read line ranges, not whole files.\n\
+signature; read line ranges, not whole files. Rewrite whole functions with \
+replace_symbol; batch related find/replace pairs into ONE edit_file call.\n\
 3. Call query_docs before using any API you are not 100% sure about.\n\
 4. Check the helpers tool before writing a new utility function.\n\
 5. When a task needs an external library and none was named, call \
@@ -90,6 +93,85 @@ fn clamp_report(s: &str) -> String {
         out.push_str("\n[report clamped]");
     }
     out
+}
+
+/// Split Scrooge's numbered plan into steps ("1. ..." / "2) ..."); unnumbered
+/// continuation lines stick to their step. A plan with no numbering is one
+/// step. Each step gets its own fresh Cratchit.
+fn plan_steps(plan: &str) -> Vec<String> {
+    let mut steps: Vec<String> = Vec::new();
+    for line in plan.lines() {
+        let t = line.trim_start();
+        let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
+        let is_new = digits > 0
+            && t[digits..]
+                .chars()
+                .next()
+                .is_some_and(|c| c == '.' || c == ')');
+        if is_new {
+            steps.push(line.trim().to_string());
+        } else if let Some(cur) = steps.last_mut() {
+            cur.push('\n');
+            cur.push_str(line);
+        }
+    }
+    if steps.is_empty() {
+        vec![plan.trim().to_string()]
+    } else {
+        steps
+    }
+}
+
+/// Compress a multi-step report for Scrooge: completed intermediate steps
+/// shrink to their first lines plus the CHECKS verdict; the final (or
+/// failing) step stays full.
+fn digest_steps(reports: &[String]) -> String {
+    let mut out = Vec::new();
+    for (i, r) in reports.iter().enumerate() {
+        let lines: Vec<&str> = r.lines().collect();
+        if i + 1 == reports.len() || lines.len() <= 6 {
+            out.push(r.clone());
+        } else {
+            out.push(format!(
+                "{}\n[...]\n{}",
+                lines[..4].join("\n"),
+                lines.last().unwrap_or(&"")
+            ));
+        }
+    }
+    out.join("\n")
+}
+
+/// Tool results older than this many assistant turns are evicted from
+/// Cratchit's log — without this, every old file dump is re-paid on each of
+/// up to 40 loop iterations (quadratic growth).
+const EVICT_AFTER_TURNS: usize = 8;
+const EVICT_MIN_CHARS: usize = 400;
+
+/// Replace large tool results older than EVICT_AFTER_TURNS assistant turns
+/// with a stub. The model can always re-run a tool it still needs.
+fn evict_old_tool_results(log: &mut [Message]) {
+    let assistants: Vec<usize> = log
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == "assistant")
+        .map(|(i, _)| i)
+        .collect();
+    if assistants.len() <= EVICT_AFTER_TURNS {
+        return;
+    }
+    let cutoff = assistants[assistants.len() - EVICT_AFTER_TURNS];
+    for m in &mut log[..cutoff] {
+        if m.role == "tool"
+            && m.content
+                .as_deref()
+                .is_some_and(|c| c.len() > EVICT_MIN_CHARS)
+        {
+            m.content = Some(
+                "[old result evicted to save tokens — re-run the tool if still needed]".into(),
+            );
+        }
+    }
 }
 
 /// Keep the tail of `s` (failure summaries end up at the bottom).
@@ -153,7 +235,7 @@ impl Orchestrator {
     /// grow with superseded history.
     pub async fn run_task(&mut self, task: &str) -> Result<String> {
         // Deterministic, zero-token context gathering.
-        let map = codemap::build(&self.toolbox.root)?;
+        let map = codemap::build_cached(&self.toolbox.root)?;
         let full_brief = map.brief();
         let guidance = practices::summary(task);
 
@@ -220,6 +302,7 @@ impl Orchestrator {
                         .and_then(|r| r.split("CHECKS: FAILING").nth(1))
                         .unwrap_or("")
                         .to_string();
+                    let prev = last_report.clone();
                     let (report, verdict) = self
                         .execute_and_verify(
                             task,
@@ -227,6 +310,7 @@ impl Orchestrator {
                                 "The deterministic check suite is failing. Fix the \
                                  failures below, then verify.\n{failures}"
                             ),
+                            prev.as_deref(),
                         )
                         .await?;
                     if let Some(c) = verdict {
@@ -254,10 +338,48 @@ impl Orchestrator {
                 ));
             }
 
-            let (report, verdict) = self.execute_and_verify(task, &plan).await?;
-            if let Some(c) = verdict {
-                checks_clean = Some(c);
+            // One fresh Cratchit per plan step, in order. Each step is
+            // verified before the next starts; a red step aborts the rest of
+            // the plan (no point building on a broken base).
+            let steps = plan_steps(&plan);
+            let prev_round = last_report.clone();
+            let mut step_reports: Vec<String> = Vec::new();
+            for (i, step) in steps.iter().enumerate() {
+                let n = i + 1;
+                let mut ctx = prev_round.clone().unwrap_or_default();
+                if !step_reports.is_empty() {
+                    ctx.push_str("\nEARLIER STEPS THIS ROUND:\n");
+                    ctx.push_str(&step_reports.join("\n"));
+                }
+                let instructions = if steps.len() > 1 {
+                    format!(
+                        "FULL PLAN (context only — do NOT execute other steps):\n{plan}\n\n\
+                         Execute ONLY step {n}:\n{step}"
+                    )
+                } else {
+                    plan.clone()
+                };
+                eprintln!("--- cratchit step {n}/{} ---", steps.len());
+                let (rep, verdict) = self
+                    .execute_and_verify(
+                        task,
+                        &instructions,
+                        (!ctx.is_empty()).then_some(ctx.as_str()),
+                    )
+                    .await?;
+                if let Some(c) = verdict {
+                    checks_clean = Some(c);
+                }
+                step_reports.push(format!("STEP {n}/{}:\n{rep}", steps.len()));
+                if verdict == Some(false) {
+                    if n < steps.len() {
+                        step_reports
+                            .push(format!("[steps {} onward skipped: checks failing]", n + 1));
+                    }
+                    break;
+                }
             }
+            let report = digest_steps(&step_reports);
             eprintln!("--- cratchit report ---\n{report}\n");
 
             digests.push(format!(
@@ -279,9 +401,14 @@ impl Orchestrator {
         &mut self,
         task: &str,
         instructions: &str,
+        prev_report: Option<&str>,
     ) -> Result<(String, Option<bool>)> {
         let before = worktree_changes(&self.toolbox.root);
-        let mut report = clamp_report(&self.cratchit_execute(task, instructions).await?);
+        let mut report = clamp_report(
+            &self
+                .cratchit_execute(task, instructions, prev_report)
+                .await?,
+        );
 
         let after = worktree_changes(&self.toolbox.root);
         if let (Some(b), Some(a)) = (&before, &after)
@@ -309,6 +436,7 @@ impl Orchestrator {
                 "--- checks failed (cratchit retry {}) ---\n{rendered}",
                 attempt + 1
             );
+            let prev = report.clone();
             report = clamp_report(
                 &self
                     .cratchit_execute(
@@ -317,6 +445,7 @@ impl Orchestrator {
                             "The deterministic check suite failed after your last \
                              changes. Fix the failures below, then verify.\n{rendered}"
                         ),
+                        Some(&prev),
                     )
                     .await?,
             );
@@ -357,7 +486,7 @@ impl Orchestrator {
             self.client.usage.prompt_tokens,
             self.client.usage.completion_tokens,
         );
-        let (report, _) = self.execute_and_verify(task, instructions).await?;
+        let (report, _) = self.execute_and_verify(task, instructions, None).await?;
         let u = &self.client.usage;
         Ok(format!(
             "{report}\n[cratchit tokens: {} in / {} out]",
@@ -371,6 +500,7 @@ impl Orchestrator {
         self.cratchit_execute(
             question,
             "Answer the question directly; investigate with tools first.",
+            None,
         )
         .await
     }
@@ -436,20 +566,29 @@ impl Orchestrator {
         Ok(kept)
     }
 
-    async fn cratchit_execute(&mut self, task: &str, plan: &str) -> Result<String> {
+    async fn cratchit_execute(
+        &mut self,
+        task: &str,
+        plan: &str,
+        prev_report: Option<&str>,
+    ) -> Result<String> {
         let defs = tools::definitions();
         // Inject context deterministically instead of having the model fetch
-        // it: the code map sliced to what the plan mentions, plus the full
-        // best-practice sections relevant to task + plan.
+        // it: the code map sliced to what the plan mentions, the full
+        // best-practice sections relevant to task + plan, and the previous
+        // round's report so already-paid-for findings aren't re-investigated.
         let context = format!("{task} {plan}");
-        let map = codemap::build(&self.toolbox.root)?.brief_for(&context);
+        let map = codemap::build_cached(&self.toolbox.root)?.brief_for(&context);
         let guidance = practices::relevant_sections(&context);
+        let prev = prev_report
+            .map(|r| format!("\nPREVIOUS ROUND REPORT (already verified facts):\n{r}\n"))
+            .unwrap_or_default();
         let mut log = vec![
             Message::text("system", CRATCHIT_SYSTEM),
             Message::text(
                 "user",
                 format!(
-                    "PROJECT ROOT: {}\nTASK: {task}\n\nSCROOGE'S INSTRUCTIONS:\n{plan}\n\n\
+                    "PROJECT ROOT: {}\nTASK: {task}\n\nSCROOGE'S INSTRUCTIONS:\n{plan}\n{prev}\n\
                      CODE MAP (files mentioned in the instructions shown in full):\n{map}\n\
                      GUIDANCE:\n{guidance}",
                     self.toolbox.root.display()
@@ -458,6 +597,7 @@ impl Orchestrator {
         ];
         // Tool loop, capped to keep the cheap model from wandering.
         for _ in 0..40 {
+            evict_old_tool_results(&mut log);
             let msg = self
                 .client
                 .chat("cratchit", &self.cheap_model, &log, &defs, None)
@@ -492,5 +632,44 @@ impl Orchestrator {
             .content
             .filter(|c| !c.trim().is_empty())
             .unwrap_or_else(|| "cratchit hit the tool-call limit without reporting".into()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_steps_splits_numbered_plans() {
+        let plan = "1. Edit foo.rs: rename bar to baz\n2) Update callers in main.rs\n   and mcp.rs\n3. Run tests";
+        let steps = plan_steps(plan);
+        assert_eq!(steps.len(), 3);
+        assert!(steps[0].contains("foo.rs"));
+        assert!(steps[1].contains("mcp.rs"), "continuation line attached");
+        // unnumbered plan = single step
+        assert_eq!(plan_steps("just fix the bug").len(), 1);
+    }
+
+    #[test]
+    fn eviction_stubs_only_old_large_tool_results() {
+        let big = "x".repeat(EVICT_MIN_CHARS + 1);
+        let mut log = vec![Message::text("system", "s"), Message::text("user", "u")];
+        for _ in 0..EVICT_AFTER_TURNS + 2 {
+            log.push(Message::text("assistant", "call"));
+            log.push(Message::tool_result("id", big.clone()));
+        }
+        evict_old_tool_results(&mut log);
+        let stubs = log
+            .iter()
+            .filter(|m| {
+                m.role == "tool" && m.content.as_deref().is_some_and(|c| c.starts_with("[old"))
+            })
+            .count();
+        assert_eq!(stubs, 2, "only results older than the keep window evicted");
+        // recent results untouched
+        assert!(
+            log.last().unwrap().content.as_deref() == Some(big.as_str()),
+            "most recent tool result must survive"
+        );
     }
 }

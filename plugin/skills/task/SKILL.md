@@ -8,11 +8,11 @@ Task: $ARGUMENTS
 
 Workflow — follow strictly:
 
-1. Call the scrooge MCP tools `get_brief` and `helpers` (with a filter relevant to the task). If the task names specific functions, use `symbol_info`/`callers` to understand the blast radius. Do NOT read source files with Read/Grep — that is Cratchit's job.
+1. Use the codebase brief already injected at session start — only call `get_brief` if files have changed since, and then pass `about` with task keywords to get the cheaper slice. Call `helpers` with a filter relevant to the task. If the task names specific functions, use `symbol_info`/`callers` to understand the blast radius. Do NOT read source files with Read/Grep — that is Cratchit's job.
 2. Write a terse numbered plan: one line per step, imperative, naming exact files and symbols. Check the `helpers` output first — never plan to write a utility that already exists in the repo or its dependencies.
 3. Dispatch the work:
    - If the environment variable `CRATCHIT_BACKEND` is `subagent`, send each step (or coherent group of steps) to the `cratchit` subagent.
    - Otherwise (default), call `give_cratchit_task` with the task and your numbered instructions.
-4. Judge each report. If something is wrong or unverified, send corrections back the same way — do not fix it yourself unless Cratchit has failed twice on the same step.
+4. Judge each report. Every report ends with machine-generated CHANGED (git diffstat) and CHECKS lines — trust those over Cratchit's prose; call `run_checks` if you need a fresh verdict (zero LLM cost). If something is wrong, send corrections back the same way — do not fix it yourself unless Cratchit has failed twice on the same step.
 5. Only read a file directly if a report is ambiguous and a targeted `symbol_info` call cannot resolve it.
 6. Finish with a summary of what changed, how it was verified, and the token bill from the Cratchit reports.

@@ -64,9 +64,11 @@ if not report or result.returncode not in (1, 2):
     sys.exit(0)  # binary mismatch or internal error, not a check verdict
 if result.returncode == 1:
     reason = (
-        "Post-task checks failed: the build/tests are broken after your changes. "
-        "Fix these errors yourself (you are Scrooge — correctness is planner work), "
-        "then stop again to re-run the checks.\n\n" + report
+        "Post-task checks failed: the build/tests are broken. Mechanical failures "
+        "are Cratchit's work — dispatch give_cratchit_task with the failure output "
+        "below as the instructions. Only fix it yourself if Cratchit has already "
+        "failed twice on the same failure. Then stop again to re-run the checks.\n\n"
+        + report
     )
 else:
     reason = (

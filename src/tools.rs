@@ -25,11 +25,15 @@ fn obj(props: Value, required: &[&str]) -> Value {
     json!({ "type": "object", "properties": props, "required": required })
 }
 
+/// Definitions ride on every model call, so they are kept terse. The
+/// `code_map` and `best_practices` bodies are no longer listed: both are
+/// injected into Cratchit's briefing deterministically (the handlers remain
+/// callable for other entry points).
 pub fn definitions() -> Vec<Value> {
     vec![
         tool(
             "read_file",
-            "Read a file. Prefer line ranges over whole files to save tokens.",
+            "Read a file. Files over 400 lines return an outline instead; pass start_line/end_line (max 250 lines per call).",
             obj(
                 json!({
                     "path": {"type": "string"},
@@ -41,7 +45,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "write_file",
-            "Create or overwrite a file with the given content.",
+            "Create or overwrite a file. Result includes a syntax verdict.",
             obj(
                 json!({"path": {"type": "string"}, "content": {"type": "string"}}),
                 &["path", "content"],
@@ -49,50 +53,71 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "edit_file",
-            "Replace an exact string in a file once. Fails if not found or ambiguous.",
+            "Apply one or more find/replace edits to a file in order, all-or-nothing. Each find must match exactly once (whitespace-tolerant fallback) unless its replace_all is true. Returns applied line numbers and a syntax verdict — no need to re-read.",
             obj(
-                json!({"path": {"type": "string"}, "find": {"type": "string"}, "replace": {"type": "string"}}),
-                &["path", "find", "replace"],
+                json!({
+                    "path": {"type": "string"},
+                    "edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "find": {"type": "string"},
+                                "replace": {"type": "string"},
+                                "replace_all": {"type": "boolean", "description": "replace every occurrence, optional"}
+                            },
+                            "required": ["find", "replace"]
+                        }
+                    }
+                }),
+                &["path", "edits"],
+            ),
+        ),
+        tool(
+            "replace_symbol",
+            "Replace an entire function/method/struct by its code-map name with new source — no find string needed, the span comes from the parser. Returns a syntax verdict. Optional path narrows when the name is ambiguous.",
+            obj(
+                json!({
+                    "name": {"type": "string", "description": "symbol name from the code map, e.g. 'parse' or 'Client.chat'"},
+                    "new_source": {"type": "string", "description": "full replacement definition"},
+                    "path": {"type": "string", "description": "file filter when ambiguous, optional"}
+                }),
+                &["name", "new_source"],
             ),
         ),
         tool(
             "shell",
-            "Run a shell command in the project root (tests, builds, grep, etc.). 60s timeout.",
+            "Run a shell command in the project root (tests, builds, grep). 60s timeout.",
             obj(json!({"command": {"type": "string"}}), &["command"]),
         ),
         tool(
             "python",
-            "Evaluate Python code for any math, counting, data transformation, or verification. ALWAYS use this instead of doing arithmetic yourself. Prints stdout.",
+            "Run Python code; use for ALL math, counting and data transformation — never compute in your head. Prints stdout.",
             obj(json!({"code": {"type": "string"}}), &["code"]),
         ),
         tool(
             "wolfram",
-            "Evaluate a WolframScript expression for symbolic math, calculus, equation solving. ALWAYS use this instead of reasoning through math yourself.",
+            "WolframScript for symbolic math, calculus, equation solving.",
             obj(json!({"expression": {"type": "string"}}), &["expression"]),
         ),
         tool(
-            "code_map",
-            "Compact symbol map of the codebase (files, functions, classes, line numbers). Cheap; call before reading files.",
-            obj(json!({}), &[]),
-        ),
-        tool(
             "symbol_info",
-            "Signature, location, callers and callees of a symbol from the call graph.",
+            "Signature, location, callers and callees of a symbol.",
             obj(json!({"name": {"type": "string"}}), &["name"]),
         ),
         tool(
             "callers",
-            "List functions that call the named function.",
+            "Functions that call the named function.",
             obj(json!({"name": {"type": "string"}}), &["name"]),
         ),
         tool(
             "callees",
-            "List functions the named function calls.",
+            "Functions the named function calls.",
             obj(json!({"name": {"type": "string"}}), &["name"]),
         ),
         tool(
             "query_docs",
-            "Query official documentation. lang=python uses pydoc; lang=rust fetches docs.rs; lang=js fetches MDN. Always check docs before using an unfamiliar API.",
+            "Official docs: python=pydoc, rust=docs.rs, js=MDN. Check before using any API you are not 100% sure about.",
             obj(
                 json!({"lang": {"type": "string", "enum": ["python", "rust", "js"]}, "query": {"type": "string", "description": "module/symbol, e.g. 'os.path.join', 'serde_json', 'Array.prototype.map'"}}),
                 &["lang", "query"],
@@ -100,32 +125,27 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "helpers",
-            "List known generic utility functions from this repo AND its dependencies. ALWAYS check here before writing a new helper — do not reinvent the wheel. Optional filter narrows by substring.",
+            "Generic utility functions known in this repo and its dependencies; check before writing a new helper. Optional substring filter.",
             obj(
-                json!({"filter": {"type": "string", "description": "substring to match against name/purpose, optional"}}),
+                json!({"filter": {"type": "string", "description": "substring filter, optional"}}),
                 &[],
             ),
         ),
         tool(
             "search_libraries",
-            "Web-search for the best external library for a need (Brave Search). ALWAYS call this before add_dependency when you need a library you weren't explicitly told to use — do not pick one from memory. Returns titles, URLs and snippets to compare candidates.",
+            "Web-search for the best external library for a need; call before add_dependency when choosing a library — do not pick from memory.",
             obj(
-                json!({"query": {"type": "string", "description": "what you need, e.g. 'rust crate for parsing TOML', 'python library async http client'"}}),
+                json!({"query": {"type": "string", "description": "what you need, e.g. 'rust crate for parsing TOML'"}}),
                 &["query"],
             ),
         ),
         tool(
             "add_dependency",
-            "Add a package dependency at its latest published version (rust: cargo add; python: pip install -U; js: npm install @latest). ALWAYS use this instead of writing version numbers into manifests yourself — versions you remember are stale.",
+            "Add a dependency at its latest published version (cargo add / pip install -U / npm install @latest). Never write version numbers from memory.",
             obj(
                 json!({"lang": {"type": "string", "enum": ["python", "rust", "js"]}, "package": {"type": "string"}, "dev": {"type": "boolean", "description": "dev-dependency, optional"}}),
                 &["lang", "package"],
             ),
-        ),
-        tool(
-            "best_practices",
-            "Fetch only the best-practice sections relevant to the given topic keywords.",
-            obj(json!({"topic": {"type": "string"}}), &["topic"]),
         ),
     ]
 }
@@ -166,12 +186,51 @@ fn fuzzy_match_ranges(content: &str, find: &str) -> Vec<(usize, usize)> {
     out
 }
 
-fn truncate(mut s: String) -> String {
-    if s.len() > MAX_OUTPUT {
-        s.truncate(MAX_OUTPUT);
-        s.push_str("\n[truncated]");
+/// Keep head AND tail when truncating: compiler errors and test failures
+/// land at the end of long outputs, which a head-only cut would discard.
+fn truncate(s: String) -> String {
+    const HEAD: usize = 2000;
+    if s.len() <= MAX_OUTPUT {
+        return s;
     }
-    s
+    let mut head_end = HEAD;
+    while !s.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = s.len() - (MAX_OUTPUT - HEAD);
+    while !s.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!(
+        "{}\n[... {} chars truncated ...]\n{}",
+        &s[..head_end],
+        tail_start - head_end,
+        &s[tail_start..]
+    )
+}
+
+/// Numbered lines around a replaced byte region, so the model can confirm an
+/// edit from the tool result instead of re-reading the file.
+fn edit_echo(content: &str, at: usize, len: usize) -> String {
+    let first = content[..at].matches('\n').count();
+    let last = first + content[at..at + len].matches('\n').count();
+    let lo = first.saturating_sub(2);
+    content
+        .lines()
+        .enumerate()
+        .skip(lo)
+        .take(last + 2 - lo + 1)
+        .map(|(i, l)| format!("{}|{l}", i + 1))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// "syntax OK" or a warning naming the first bad line, per tree-sitter.
+fn syntax_verdict(path: &Path, src: &str) -> String {
+    match codemap::syntax_error_line(path, src) {
+        Some(line) => format!("WARNING: syntax error near line {line}"),
+        None => "syntax OK".into(),
+    }
 }
 
 impl Toolbox {
@@ -268,38 +327,18 @@ impl Toolbox {
                 if let Some(dir) = path.parent() {
                     std::fs::create_dir_all(dir)?;
                 }
-                std::fs::write(&path, s("content"))?;
-                Ok(format!("wrote {}", path.display()))
+                let content = s("content");
+                std::fs::write(&path, &content)?;
+                Ok(format!(
+                    "wrote {} ({})",
+                    path.display(),
+                    syntax_verdict(&path, &content)
+                ))
             }
-            "edit_file" => {
-                let path = self.resolve_write(&s("path"))?;
-                let content = std::fs::read_to_string(&path)?;
-                let find = s("find");
-                match content.matches(&find).count() {
-                    0 => {
-                        // Deterministic fallback: match ignoring per-line
-                        // leading/trailing whitespace before bouncing back
-                        // to the model for another expensive retry.
-                        match fuzzy_match_ranges(&content, &find).as_slice() {
-                            [] => anyhow::bail!("string not found in {}", path.display()),
-                            [(a, b)] => {
-                                let new =
-                                    format!("{}{}{}", &content[..*a], s("replace"), &content[*b..]);
-                                std::fs::write(&path, new)?;
-                                Ok("edited (whitespace-tolerant match)".into())
-                            }
-                            m => anyhow::bail!(
-                                "string matches {} places ignoring whitespace; provide more context",
-                                m.len()
-                            ),
-                        }
-                    }
-                    1 => {
-                        std::fs::write(&path, content.replacen(&find, &s("replace"), 1))?;
-                        Ok("edited".into())
-                    }
-                    n => anyhow::bail!("string appears {n} times; provide more context"),
-                }
+            "edit_file" => self.edit_file(args).await,
+            "replace_symbol" => {
+                self.replace_symbol(&s("name"), &s("new_source"), &s("path"))
+                    .await
             }
             "shell" => self.run("bash", &["-c", &s("command")]).await,
             "python" => self.run("python3", &["-c", &s("code")]).await,
@@ -307,14 +346,14 @@ impl Toolbox {
                 self.run("wolframscript", &["-code", &s("expression")])
                     .await
             }
-            "code_map" => Ok(codemap::build(&self.root)?.brief()),
-            "symbol_info" => Ok(codemap::build(&self.root)?.detail(&s("name"))),
+            "code_map" => Ok(codemap::build_cached(&self.root)?.brief()),
+            "symbol_info" => Ok(codemap::build_cached(&self.root)?.detail(&s("name"))),
             "callers" => {
-                let m = codemap::build(&self.root)?;
+                let m = codemap::build_cached(&self.root)?;
                 Ok(m.callers_of(&s("name")).join("\n"))
             }
             "callees" => {
-                let m = codemap::build(&self.root)?;
+                let m = codemap::build_cached(&self.root)?;
                 Ok(m.callees_of(&s("name")).join("\n"))
             }
             "helpers" => crate::helpers::filtered_listing(&self.root, &s("filter")),
@@ -329,9 +368,161 @@ impl Toolbox {
         }
     }
 
+    /// Batched find/replace: edits apply in order on an in-memory copy and
+    /// nothing is written unless every edit succeeds, so a failure report
+    /// always means "file untouched".
+    async fn edit_file(&self, args: &Value) -> Result<String> {
+        let path = self.resolve_write(args["path"].as_str().unwrap_or(""))?;
+        let mut content = std::fs::read_to_string(&path)?;
+
+        struct E {
+            find: String,
+            replace: String,
+            all: bool,
+        }
+        // Array form is canonical; the legacy single find/replace form is
+        // still accepted so a confused model isn't hard-stuck.
+        let edits: Vec<E> = match args["edits"].as_array() {
+            Some(arr) => arr
+                .iter()
+                .map(|e| E {
+                    find: e["find"].as_str().unwrap_or("").to_string(),
+                    replace: e["replace"].as_str().unwrap_or("").to_string(),
+                    all: e["replace_all"].as_bool().unwrap_or(false),
+                })
+                .collect(),
+            None => vec![E {
+                find: args["find"].as_str().unwrap_or("").to_string(),
+                replace: args["replace"].as_str().unwrap_or("").to_string(),
+                all: args["replace_all"].as_bool().unwrap_or(false),
+            }],
+        };
+        if edits.is_empty() || edits.iter().any(|e| e.find.is_empty()) {
+            anyhow::bail!("no edits given (each needs a non-empty `find`)");
+        }
+
+        let line_of = |content: &str, at: usize| content[..at].matches('\n').count() + 1;
+        let mut notes = Vec::new();
+        let mut single_region: Option<(usize, usize)> = None;
+        for (i, e) in edits.iter().enumerate() {
+            let n = i + 1;
+            match content.matches(&e.find).count() {
+                0 => match fuzzy_match_ranges(&content, &e.find).as_slice() {
+                    [] => anyhow::bail!(
+                        "edit {n}: string not found in {} — no edits applied",
+                        path.display()
+                    ),
+                    [(a, b)] => {
+                        let (a, b) = (*a, *b);
+                        content = format!("{}{}{}", &content[..a], e.replace, &content[b..]);
+                        notes.push(format!(
+                            "edit {n}: line {} (whitespace-tolerant)",
+                            line_of(&content, a)
+                        ));
+                        single_region = Some((a, e.replace.len()));
+                    }
+                    m => anyhow::bail!(
+                        "edit {n}: matches {} places ignoring whitespace — no edits applied",
+                        m.len()
+                    ),
+                },
+                1 => {
+                    let at = content.find(&e.find).unwrap_or(0);
+                    content = content.replacen(&e.find, &e.replace, 1);
+                    notes.push(format!("edit {n}: line {}", line_of(&content, at)));
+                    single_region = Some((at, e.replace.len()));
+                }
+                c if e.all => {
+                    content = content.replace(&e.find, &e.replace);
+                    notes.push(format!("edit {n}: replaced {c} occurrences"));
+                    single_region = None;
+                }
+                c => anyhow::bail!(
+                    "edit {n}: string appears {c} times; set replace_all or provide \
+                     more context — no edits applied"
+                ),
+            }
+        }
+        std::fs::write(&path, &content)?;
+
+        let mut out = format!(
+            "applied {} edit(s) ({}); {}",
+            edits.len(),
+            notes.join("; "),
+            syntax_verdict(&path, &content)
+        );
+        if edits.len() == 1
+            && let Some((at, len)) = single_region
+        {
+            out.push('\n');
+            out.push_str(&edit_echo(&content, at, len));
+        }
+        Ok(out)
+    }
+
+    /// Replace a whole definition by its code-map name: the parser supplies
+    /// the byte span, so no find string is needed and no match can be
+    /// ambiguous (an ambiguous *name* is reported with candidate locations).
+    async fn replace_symbol(
+        &self,
+        name: &str,
+        new_source: &str,
+        path_filter: &str,
+    ) -> Result<String> {
+        if name.is_empty() || new_source.trim().is_empty() {
+            anyhow::bail!("replace_symbol needs `name` and non-empty `new_source`");
+        }
+        let map = codemap::build_cached(&self.root)?;
+        let candidates: Vec<_> = map
+            .symbols
+            .iter()
+            .filter(|sym| sym.name == name || sym.name.ends_with(&format!(".{name}")))
+            .filter(|sym| {
+                path_filter.is_empty() || sym.file.display().to_string().contains(path_filter)
+            })
+            .collect();
+        let sym = match candidates.as_slice() {
+            [] => anyhow::bail!("no symbol named '{name}' in the code map"),
+            [one] => *one,
+            many => anyhow::bail!(
+                "'{name}' is ambiguous; pass `path` to pick one of: {}",
+                many.iter()
+                    .map(|s| format!("{}:{}", s.file.display(), s.line))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        let path = self.resolve_write(&sym.file.display().to_string())?;
+        let content = std::fs::read_to_string(&path)?;
+        let lines: Vec<&str> = content.lines().collect();
+        if sym.end_line > lines.len() || sym.line == 0 {
+            anyhow::bail!("stale span for '{name}' — file changed; retry");
+        }
+        let mut new_lines: Vec<&str> = lines[..sym.line - 1].to_vec();
+        let body = new_source.trim_end_matches('\n');
+        new_lines.extend(body.lines());
+        new_lines.extend(&lines[sym.end_line..]);
+        let mut new = new_lines.join("\n");
+        if content.ends_with('\n') {
+            new.push('\n');
+        }
+        std::fs::write(&path, &new)?;
+
+        let at: usize = new.lines().take(sym.line - 1).map(|l| l.len() + 1).sum();
+        Ok(format!(
+            "replaced {} ({}:{}-{}); {}\n{}",
+            sym.name,
+            sym.file.display(),
+            sym.line,
+            sym.end_line,
+            syntax_verdict(&path, &new),
+            edit_echo(&new, at, body.len())
+        ))
+    }
+
     /// Symbol outline returned instead of an oversized whole-file read.
     fn file_outline(&self, path: &Path, total_lines: usize) -> Result<String> {
-        let map = codemap::build(&self.root)?;
+        let map = codemap::build_cached(&self.root)?;
         let rel = path.strip_prefix(&self.root).unwrap_or(path);
         let outline: String = map
             .symbols
@@ -415,7 +606,8 @@ impl Toolbox {
         match lang {
             "python" => self.run("python3", &["-m", "pydoc", query]).await,
             "rust" => {
-                // docs.rs serves a text-friendly page per crate/item; strip tags crudely.
+                // docs.rs serves a text-friendly page per crate/item; strip
+                // tags, then skip the nav boilerplate before the item itself.
                 let krate = query.split("::").next().unwrap_or(query);
                 let item = query.replace("::", "/");
                 let url = if krate == query {
@@ -423,14 +615,44 @@ impl Toolbox {
                 } else {
                     format!("https://docs.rs/{krate}/latest/{item}/")
                 };
-                fetch_text(&url).await
+                let text = fetch_text(&url).await?;
+                let needle = query.rsplit("::").next().unwrap_or(query);
+                let start = text.find(needle).unwrap_or(0);
+                let mut end = (start + 4000).min(text.len());
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                Ok(text[start..end].to_string())
             }
             "js" => {
+                // MDN's search API returns JSON; extract title/summary/url
+                // instead of dumping the raw payload on the model.
                 let q = query.replace(' ', "+");
-                fetch_text(&format!(
-                    "https://developer.mozilla.org/api/v1/search?q={q}&locale=en-US"
-                ))
-                .await
+                let url = format!("https://developer.mozilla.org/api/v1/search?q={q}&locale=en-US");
+                let v: Value = reqwest::Client::new()
+                    .get(&url)
+                    .header("User-Agent", "scrooge-agent")
+                    .send()
+                    .await?
+                    .json()
+                    .await?;
+                let docs = v["documents"].as_array().cloned().unwrap_or_default();
+                if docs.is_empty() {
+                    return Ok("no MDN results".into());
+                }
+                Ok(docs
+                    .iter()
+                    .take(5)
+                    .map(|d| {
+                        format!(
+                            "{} — {}\n  https://developer.mozilla.org{}",
+                            d["title"].as_str().unwrap_or(""),
+                            d["summary"].as_str().unwrap_or("").trim(),
+                            d["mdn_url"].as_str().unwrap_or("")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"))
             }
             _ => anyhow::bail!("unsupported lang {lang}"),
         }
@@ -552,6 +774,84 @@ mod tests {
             "sandbox escape: wrote {target}"
         );
         assert!(out.contains("[exit"), "expected failure, got: {out}");
+    }
+
+    #[tokio::test]
+    async fn edit_file_batch_is_all_or_nothing() {
+        let tb = toolbox();
+        let p = tb.root.join("batch.rs");
+        std::fs::write(&p, "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
+        // second edit fails -> nothing applied
+        let out = tb
+            .call(
+                "edit_file",
+                &json!({"path": "batch.rs", "edits": [
+                    {"find": "fn a", "replace": "fn alpha"},
+                    {"find": "fn zzz", "replace": "fn z"}
+                ]}),
+            )
+            .await;
+        assert!(out.contains("no edits applied"), "unexpected: {out}");
+        assert!(std::fs::read_to_string(&p).unwrap().contains("fn a()"));
+        // valid batch applies in order, with replace_all
+        let out = tb
+            .call(
+                "edit_file",
+                &json!({"path": "batch.rs", "edits": [
+                    {"find": "fn a", "replace": "fn alpha"},
+                    {"find": "()", "replace": "(x: u8)", "replace_all": true}
+                ]}),
+            )
+            .await;
+        assert!(out.contains("applied 2 edit(s)"), "unexpected: {out}");
+        assert!(out.contains("3 occurrences"), "unexpected: {out}");
+        let now = std::fs::read_to_string(&p).unwrap();
+        assert!(now.contains("fn alpha(x: u8)"));
+        assert!(now.contains("fn c(x: u8)"));
+    }
+
+    #[tokio::test]
+    async fn replace_symbol_swaps_the_whole_definition() {
+        let tb = toolbox();
+        std::fs::write(
+            tb.root.join("sym.rs"),
+            "fn keep() {\n    1;\n}\n\nfn target() {\n    old();\n    old();\n}\n",
+        )
+        .unwrap();
+        let out = tb
+            .call(
+                "replace_symbol",
+                &json!({"name": "target", "new_source": "fn target() {\n    new();\n}"}),
+            )
+            .await;
+        assert!(out.contains("replaced target"), "unexpected: {out}");
+        assert!(out.contains("syntax OK"), "unexpected: {out}");
+        let now = std::fs::read_to_string(tb.root.join("sym.rs")).unwrap();
+        assert!(now.contains("fn keep()"), "untouched neighbor");
+        assert!(now.contains("new()"));
+        assert!(!now.contains("old()"));
+    }
+
+    #[test]
+    fn truncate_keeps_head_and_tail() {
+        let s = format!("HEAD{}TAIL", "x".repeat(MAX_OUTPUT * 2));
+        let t = truncate(s);
+        assert!(t.starts_with("HEAD"));
+        assert!(t.ends_with("TAIL"));
+        assert!(t.contains("truncated"));
+        assert!(t.len() < MAX_OUTPUT + 100);
+    }
+
+    #[test]
+    fn edit_echo_numbers_the_region() {
+        let content = "a\nb\nNEW1\nNEW2\nc\nd\ne\nf\n";
+        let at = content.find("NEW1").unwrap();
+        let echo = edit_echo(content, at, "NEW1\nNEW2".len());
+        assert!(echo.contains("3|NEW1"));
+        assert!(echo.contains("4|NEW2"));
+        assert!(echo.contains("1|a"), "leading context");
+        assert!(echo.contains("6|d"), "trailing context");
+        assert!(!echo.contains("7|e"), "bounded context");
     }
 
     #[test]

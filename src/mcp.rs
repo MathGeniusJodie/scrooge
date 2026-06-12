@@ -29,7 +29,13 @@ fn tool_list() -> Value {
     json!([
         tool(
             "get_brief",
-            "Compact codebase map: every file with its functions/classes/line numbers. Call this before anything else; never read source files directly — that's what Cratchit is for.",
+            "Compact codebase map: every file with its functions/classes/line numbers. Pass `about` (task keywords) to get a slice — only matching files in full, the rest as names. Never read source files directly — that's what Cratchit is for.",
+            json!({"about": {"type": "string", "description": "task keywords to slice the brief by, optional"}}),
+            &[]
+        ),
+        tool(
+            "run_checks",
+            "Run the deterministic check suite (format, tests, lint autofix) and return the verdict. Zero LLM cost — use this to verify instead of dispatching Cratchit.",
             json!({}),
             &[]
         ),
@@ -149,12 +155,26 @@ impl Server {
     async fn call_tool(&mut self, name: &str, args: &Value) -> Result<String> {
         let s = |k: &str| args[k].as_str().unwrap_or("").to_string();
         match name {
-            "get_brief" => Ok(codemap::build(&self.root)?.brief()),
-            "symbol_info" => Ok(codemap::build(&self.root)?.detail(&s("name"))),
-            "callers" => Ok(codemap::build(&self.root)?
+            "get_brief" => {
+                let map = codemap::build_cached(&self.root)?;
+                let about = s("about");
+                Ok(if about.is_empty() {
+                    map.brief()
+                } else {
+                    map.brief_for(&about)
+                })
+            }
+            "run_checks" => {
+                let root = self.root.clone();
+                let report =
+                    tokio::task::spawn_blocking(move || crate::checks::run(&root)).await??;
+                Ok(crate::checks::render(&report))
+            }
+            "symbol_info" => Ok(codemap::build_cached(&self.root)?.detail(&s("name"))),
+            "callers" => Ok(codemap::build_cached(&self.root)?
                 .callers_of(&s("name"))
                 .join("\n")),
-            "callees" => Ok(codemap::build(&self.root)?
+            "callees" => Ok(codemap::build_cached(&self.root)?
                 .callees_of(&s("name"))
                 .join("\n")),
             "best_practices" => Ok(practices::relevant_sections(&s("topic"))),

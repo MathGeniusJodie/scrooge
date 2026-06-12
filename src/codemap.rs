@@ -5,6 +5,8 @@
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::SystemTime;
 use tree_sitter::{Language, Node, Parser};
 use walkdir::WalkDir;
 
@@ -128,6 +130,87 @@ pub fn build_limited(root: &Path, max_files: usize) -> Result<CodeMap> {
     }
     resolve_calls(&mut map);
     Ok(map)
+}
+
+type CacheEntry = (PathBuf, SystemTime, usize, Arc<CodeMap>);
+static CACHE: OnceLock<Mutex<Option<CacheEntry>>> = OnceLock::new();
+
+/// Cheap staleness key: newest mtime + count of indexable source files.
+/// Walking metadata is far cheaper than re-parsing every file.
+fn cache_key(root: &Path) -> (SystemTime, usize) {
+    let mut newest = SystemTime::UNIX_EPOCH;
+    let mut count = 0usize;
+    for entry in WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|e| {
+            !e.file_name()
+                .to_str()
+                .map(|n| SKIP_DIRS.contains(&n))
+                .unwrap_or(false)
+        })
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        if lang_for(entry.path()).is_none() {
+            continue;
+        }
+        count += 1;
+        if let Ok(meta) = entry.metadata()
+            && let Ok(t) = meta.modified()
+            && t > newest
+        {
+            newest = t;
+        }
+    }
+    (newest, count)
+}
+
+/// `build` behind an mtime-keyed process cache, for tool calls that hit the
+/// map repeatedly within one session.
+pub fn build_cached(root: &Path) -> Result<Arc<CodeMap>> {
+    let (mtime, count) = cache_key(root);
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache.lock().unwrap();
+    if let Some((r, t, c, map)) = guard.as_ref()
+        && r == root
+        && *t == mtime
+        && *c == count
+    {
+        return Ok(map.clone());
+    }
+    let map = Arc::new(build(root)?);
+    *guard = Some((root.to_path_buf(), mtime, count, map.clone()));
+    Ok(map)
+}
+
+/// Line of the first syntax error in `src` per the file's grammar, or None
+/// when the file parses (or has no grammar). Lets write/edit tools report a
+/// broken edit in the same turn instead of waiting for the test run.
+pub fn syntax_error_line(path: &Path, src: &str) -> Option<usize> {
+    let lang = lang_for(path)?;
+    if matches!(lang, Lang::Html) {
+        return None; // html parses almost anything; not worth flagging
+    }
+    let mut parser = Parser::new();
+    parser.set_language(&ts_language(&lang)).ok()?;
+    let tree = parser.parse(src, None)?;
+    first_error_line(tree.root_node())
+}
+
+fn first_error_line(node: Node) -> Option<usize> {
+    if node.is_error() || node.is_missing() {
+        return Some(node.start_position().row + 1);
+    }
+    if !node.has_error() {
+        return None;
+    }
+    let mut c = node.walk();
+    for child in node.children(&mut c) {
+        if let Some(line) = first_error_line(child) {
+            return Some(line);
+        }
+    }
+    None
 }
 
 fn ts_language(lang: &Lang) -> Language {
@@ -515,6 +598,21 @@ impl CodeMap {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn syntax_error_line_flags_broken_rust() {
+        let path = std::path::Path::new("x.rs");
+        assert_eq!(
+            super::syntax_error_line(path, "fn ok() { let a = 1; }"),
+            None
+        );
+        assert!(super::syntax_error_line(path, "fn broken( { let a = ; }").is_some());
+        // no grammar -> no verdict
+        assert_eq!(
+            super::syntax_error_line(std::path::Path::new("x.txt"), "anything"),
+            None
+        );
+    }
+
     #[test]
     fn contains_word_respects_identifier_boundaries() {
         assert!(super::contains_word("update the rust tests", "rust"));
