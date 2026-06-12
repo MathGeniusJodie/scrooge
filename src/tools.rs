@@ -154,6 +154,34 @@ impl Toolbox {
         }
     }
 
+    /// Resolve a path for writing; refuse anything outside the project root.
+    /// Canonicalizes the nearest existing ancestor so `..` and symlinks
+    /// can't escape.
+    fn resolve_write(&self, p: &str) -> Result<PathBuf> {
+        let path = self.resolve(p);
+        let mut probe = path.as_path();
+        let canonical = loop {
+            match probe.canonicalize() {
+                Ok(c) => break c,
+                Err(_) => match probe.parent() {
+                    Some(parent) => probe = parent,
+                    None => anyhow::bail!("cannot resolve {}", path.display()),
+                },
+            }
+        };
+        let root = self.root.canonicalize()?;
+        if !canonical.starts_with(&root) {
+            anyhow::bail!(
+                "denied: {} is outside the project root {}. Writes outside the \
+                 project require user confirmation — report this as a blocker \
+                 instead of working around it.",
+                path.display(),
+                root.display()
+            );
+        }
+        Ok(path)
+    }
+
     pub async fn call(&self, name: &str, args: &Value) -> String {
         let result = self.dispatch(name, args).await;
         truncate(match result {
@@ -184,7 +212,7 @@ impl Toolbox {
                 })
             }
             "write_file" => {
-                let path = self.resolve(&s("path"));
+                let path = self.resolve_write(&s("path"))?;
                 if let Some(dir) = path.parent() {
                     std::fs::create_dir_all(dir)?;
                 }
@@ -192,7 +220,7 @@ impl Toolbox {
                 Ok(format!("wrote {}", path.display()))
             }
             "edit_file" => {
-                let path = self.resolve(&s("path"));
+                let path = self.resolve_write(&s("path"))?;
                 let content = std::fs::read_to_string(&path)?;
                 let find = s("find");
                 match content.matches(&find).count() {
@@ -253,12 +281,21 @@ impl Toolbox {
     }
 
     async fn run(&self, prog: &str, args: &[&str]) -> Result<String> {
+        let mut cmd = Command::new(prog);
+        cmd.args(args).current_dir(&self.root);
+        let sandbox_root = self.root.clone();
+        // Confine the child: read anywhere, write only inside the project
+        // root plus /tmp and package-manager caches. Best-effort — on a
+        // kernel without Landlock the command still runs.
+        unsafe {
+            cmd.pre_exec(move || {
+                let _ = sandbox::confine(&sandbox_root);
+                Ok(())
+            });
+        }
         let out = tokio::time::timeout(
             std::time::Duration::from_secs(60),
-            Command::new(prog)
-                .args(args)
-                .current_dir(&self.root)
-                .output(),
+            cmd.output(),
         )
         .await
         .map_err(|_| anyhow::anyhow!("timed out after 60s"))??;
@@ -286,8 +323,15 @@ impl Toolbox {
                 self.run("cargo", &args).await
             }
             "python" => {
+                // Install into a project-local venv so the package lands
+                // inside the working directory, not user site-packages.
+                let venv = self.root.join(".venv");
+                if !venv.exists() {
+                    self.run("python3", &["-m", "venv", ".venv"]).await?;
+                }
+                let pip = venv.join("bin/python");
                 self.run(
-                    "python3",
+                    pip.to_str().unwrap_or("python3"),
                     &["-m", "pip", "install", "--upgrade", package],
                 )
                 .await
@@ -327,6 +371,78 @@ impl Toolbox {
             }
             _ => anyhow::bail!("unsupported lang {lang}"),
         }
+    }
+}
+
+mod sandbox {
+    use landlock::{
+        ABI, Access, AccessFs, Ruleset, RulesetAttr, RulesetCreatedAttr, path_beneath_rules,
+    };
+    use std::path::{Path, PathBuf};
+
+    /// Landlock policy: read the whole filesystem, write only beneath the
+    /// project root, /tmp, /dev (null, shm, …) and the package-manager
+    /// caches that `cargo`/`npm`/`pip` need to function.
+    pub fn confine(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let abi = ABI::V2;
+        let mut writable: Vec<PathBuf> =
+            vec![root.to_path_buf(), "/tmp".into(), "/dev".into()];
+        if let Ok(home) = std::env::var("HOME") {
+            for d in [".cargo", ".npm", ".cache"] {
+                writable.push(Path::new(&home).join(d));
+            }
+        }
+        writable.retain(|p| p.exists());
+        Ruleset::default()
+            .handle_access(AccessFs::from_all(abi))?
+            .create()?
+            .add_rules(path_beneath_rules(["/"], AccessFs::from_read(abi)))?
+            .add_rules(path_beneath_rules(&writable, AccessFs::from_all(abi)))?
+            .restrict_self()?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn toolbox() -> Toolbox {
+        let root = std::env::temp_dir().join(format!("scrooge-sbx-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        Toolbox::new(root)
+    }
+
+    #[tokio::test]
+    async fn shell_write_inside_root_allowed() {
+        let tb = toolbox();
+        let out = tb
+            .call("shell", &json!({"command": "echo hi > inside.txt && cat inside.txt"}))
+            .await;
+        assert!(out.contains("hi"), "unexpected: {out}");
+    }
+
+    #[tokio::test]
+    async fn shell_write_outside_root_denied() {
+        let tb = toolbox();
+        let target = format!("{}/scrooge-landlock-escape", std::env::var("HOME").unwrap());
+        let out = tb
+            .call("shell", &json!({"command": format!("echo pwned > {target}")}))
+            .await;
+        assert!(
+            !std::path::Path::new(&target).exists(),
+            "sandbox escape: wrote {target}"
+        );
+        assert!(out.contains("[exit"), "expected failure, got: {out}");
+    }
+
+    #[tokio::test]
+    async fn write_file_outside_root_denied() {
+        let tb = toolbox();
+        let out = tb
+            .call("write_file", &json!({"path": "../escape.txt", "content": "x"}))
+            .await;
+        assert!(out.contains("denied"), "unexpected: {out}");
     }
 }
 
