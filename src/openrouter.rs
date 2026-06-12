@@ -81,12 +81,14 @@ impl Client {
 
     /// One chat completion. `agent` ("scrooge"/"cratchit") attributes the
     /// tokens in the ledger. `tools` is an OpenAI-format tool list or empty.
+    /// `max_tokens` hard-caps the completion (used to keep Scrooge terse).
     pub async fn chat(
         &mut self,
         agent: &str,
         model: &str,
         messages: &[Message],
         tools: &[Value],
+        max_tokens: Option<u32>,
     ) -> Result<Message> {
         let mut body = serde_json::json!({
             "model": model,
@@ -94,6 +96,9 @@ impl Client {
         });
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools.to_vec());
+        }
+        if let Some(cap) = max_tokens {
+            body["max_tokens"] = serde_json::json!(cap);
         }
         let resp = self
             .http

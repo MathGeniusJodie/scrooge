@@ -2,11 +2,18 @@
 //! briefs and terse reports — he plans, reviews, and decides. Cratchit
 //! (cheap model) does all the token-heavy tool work and must compress
 //! everything he sends upstairs.
+//!
+//! Everything that can be decided deterministically is: the code map and
+//! relevant guidance are injected rather than fetched by the model, checks
+//! run after every execution and their verdict is appended to the report,
+//! mechanical check failures loop straight back to Cratchit without burning
+//! a Scrooge round, and DONE is only accepted while checks are green.
 
 use anyhow::Result;
 use serde_json::Value;
 use std::path::PathBuf;
 
+use crate::checks;
 use crate::codemap;
 use crate::helpers::Helper;
 use crate::openrouter::{Client, DEV_MODEL_CHEAP, DEV_MODEL_SOTA, Message};
@@ -20,27 +27,40 @@ You never read full files, never write code, and never use tools. You direct Cra
 a junior agent with full tool access (files, shell, python, wolfram, docs, call graph).\n\
 When given a task and a codebase brief, reply with a numbered plan of concrete steps \
 for Cratchit. Each step: one line, imperative, naming exact files/symbols where known. \
-When given a progress report, reply either with corrections/next steps (same format) \
-or the single word DONE if the task is complete and verified. No preamble, no prose.";
+Every Cratchit report ends with a machine-generated CHECKS line (format/test/lint run \
+deterministically) — trust it over Cratchit's own claims. When given a progress report, \
+reply either with corrections/next steps (same format) or the single word DONE if the \
+task is complete and CHECKS is clean. No preamble, no prose.";
 
 const CRATCHIT_SYSTEM: &str = "\
 You are Cratchit, a diligent coding agent executing a plan written by Scrooge, \
-your demanding boss whose time is very valuable. Rules:\n\
+your demanding boss whose time is very valuable. A code map of the relevant files \
+and the applicable best-practice guidance are already included in your briefing. \
+Rules:\n\
 1. Use tools for everything. NEVER do arithmetic or logic in your head when the \
 python or wolfram tool can do it deterministically.\n\
-2. Call code_map / symbol_info / callers before reading files; read line ranges, \
-not whole files.\n\
+2. Use the included code map; call symbol_info / callers before changing any \
+signature; read line ranges, not whole files.\n\
 3. Call query_docs before using any API you are not 100% sure about.\n\
-4. Call best_practices with topic keywords before writing code.\n\
+4. Check the helpers tool before writing a new utility function.\n\
 5. When a task needs an external library and none was named, call \
 search_libraries to find the current best option — never pick one from \
 memory. Then add it with add_dependency, which installs the LATEST published \
 version. Never write a version number into a manifest from memory — your \
 training data is stale.\n\
-6. Verify your work (compile, run, test) before reporting.\n\
+6. Verify your work (compile, run, test) before reporting; a deterministic \
+check suite also runs after you finish.\n\
 7. Your final message is a report for Scrooge: maximum 6 lines, only facts he \
 needs (what changed, file:line, verification result, blockers). No pleasantries, \
 no restating the plan, no code unless a decision depends on it.";
+
+/// Completion cap for Scrooge: plans are numbered one-liners, so anything
+/// past this is waste on the expensive model.
+const SCROOGE_MAX_TOKENS: u32 = 700;
+
+/// How many times a failing check report is routed straight back to Cratchit
+/// before the failure is escalated to Scrooge.
+const CHECK_RETRIES: usize = 2;
 
 pub struct Orchestrator {
     client: Client,
@@ -61,31 +81,66 @@ impl Orchestrator {
         })
     }
 
-    /// Full task loop: brief -> Scrooge plan -> Cratchit executes -> report ->
-    /// Scrooge reviews -> ... until DONE or round cap.
+    /// Full task loop: brief -> Scrooge plan -> Cratchit executes -> checks
+    /// run -> report -> Scrooge reviews -> ... until DONE or round cap.
+    ///
+    /// Scrooge's context is rebuilt every round: system + original brief +
+    /// one-line digests of earlier rounds + only the latest plan/report, so
+    /// his prompt does not grow with superseded history.
     pub async fn run_task(&mut self, task: &str) -> Result<String> {
         // Deterministic, zero-token context gathering.
         let brief = codemap::build(&self.toolbox.root)?.brief();
-        let guidance = practices::relevant_sections(task);
+        let guidance = practices::summary(task);
 
-        let mut scrooge_log = vec![
-            Message::text("system", SCROOGE_SYSTEM),
-            Message::text(
-                "user",
-                format!("TASK: {task}\n\nCODEBASE BRIEF:\n{brief}\nRELEVANT GUIDANCE:\n{guidance}"),
-            ),
-        ];
+        let intro = format!(
+            "TASK: {task}\n\nCODEBASE BRIEF:\n{brief}\nKEY GUIDANCE:\n{guidance}"
+        );
+        let mut digests: Vec<String> = Vec::new();
+        let mut last_plan: Option<String> = None;
+        let mut last_report: Option<String> = None;
+        let mut checks_clean: Option<bool> = None;
 
         for round in 1..=self.max_rounds {
+            let mut log = vec![
+                Message::text("system", SCROOGE_SYSTEM),
+                Message::text("user", intro.clone()),
+            ];
+            if !digests.is_empty() {
+                log.push(Message::text(
+                    "user",
+                    format!("EARLIER ROUNDS (digest):\n{}", digests.join("\n")),
+                ));
+            }
+            if let (Some(plan), Some(report)) = (&last_plan, &last_report) {
+                log.push(Message::text("assistant", plan.clone()));
+                log.push(Message::text("user", format!("CRATCHIT REPORT:\n{report}")));
+            }
+
             let plan_msg = self
                 .client
-                .chat("scrooge", &self.sota_model, &scrooge_log, &[])
+                .chat(
+                    "scrooge",
+                    &self.sota_model,
+                    &log,
+                    &[],
+                    Some(SCROOGE_MAX_TOKENS),
+                )
                 .await?;
-            let plan = plan_msg.content.clone().unwrap_or_default();
-            scrooge_log.push(plan_msg);
+            let plan = plan_msg.content.unwrap_or_default();
             eprintln!("--- scrooge (round {round}) ---\n{plan}\n");
 
-            if plan.trim() == "DONE" || plan.trim().starts_with("DONE") {
+            if plan.trim().starts_with("DONE") {
+                if checks_clean == Some(false) {
+                    // DONE is not Scrooge's to grant while checks are red.
+                    digests.push(format!("round {round}: DONE rejected (checks failing)"));
+                    last_plan = Some(plan);
+                    last_report = Some(
+                        "DONE not accepted: the deterministic checks are still failing \
+                         (see previous CHECKS output). Issue corrective steps."
+                            .into(),
+                    );
+                    continue;
+                }
                 let u = &self.client.usage;
                 return Ok(format!(
                     "task complete in {round} round(s). tokens: {} in / {} out",
@@ -93,21 +148,68 @@ impl Orchestrator {
                 ));
             }
 
-            let report = self.cratchit_execute(task, &plan).await?;
+            let mut report = self.cratchit_execute(task, &plan).await?;
+            // Deterministic verification; mechanical failures loop straight
+            // back to Cratchit instead of burning a Scrooge round.
+            let mut clean = false;
+            for attempt in 0..=CHECK_RETRIES {
+                let check = self.run_checks().await?;
+                if check.errors.is_empty() && check.warnings.is_empty() {
+                    clean = true;
+                    break;
+                }
+                let rendered = checks::render(&check);
+                if attempt == CHECK_RETRIES {
+                    report.push_str(&format!("\nCHECKS: FAILING\n{rendered}"));
+                    break;
+                }
+                eprintln!("--- checks failed (cratchit retry {}) ---\n{rendered}", attempt + 1);
+                report = self
+                    .cratchit_execute(
+                        task,
+                        &format!(
+                            "The deterministic check suite failed after your last \
+                             changes. Fix the failures below, then verify.\n{rendered}"
+                        ),
+                    )
+                    .await?;
+            }
+            if clean {
+                report.push_str("\nCHECKS: clean");
+            }
+            checks_clean = Some(clean);
             eprintln!("--- cratchit report ---\n{report}\n");
-            scrooge_log.push(Message::text("user", format!("CRATCHIT REPORT:\n{report}")));
+
+            digests.push(format!(
+                "round {round}: {} -> {}",
+                plan.lines().next().unwrap_or("").trim(),
+                report.lines().next().unwrap_or("").trim()
+            ));
+            last_plan = Some(plan);
+            last_report = Some(report);
         }
         Ok("round limit reached without DONE; review output above".into())
     }
 
+    async fn run_checks(&self) -> Result<checks::Report> {
+        let root = self.toolbox.root.clone();
+        tokio::task::spawn_blocking(move || checks::run(&root)).await?
+    }
+
     /// Dispatch a pre-planned task to Cratchit (used by MCP mode, where the
-    /// Claude Code conversation plays Scrooge). Appends the token bill.
+    /// Claude Code conversation plays Scrooge). Appends the token bill for
+    /// this call only (usage accumulates across the server's lifetime).
     pub async fn delegate(&mut self, task: &str, instructions: &str) -> Result<String> {
+        let before = (
+            self.client.usage.prompt_tokens,
+            self.client.usage.completion_tokens,
+        );
         let report = self.cratchit_execute(task, instructions).await?;
         let u = &self.client.usage;
         Ok(format!(
             "{report}\n[cratchit tokens: {} in / {} out]",
-            u.prompt_tokens, u.completion_tokens
+            u.prompt_tokens - before.0,
+            u.completion_tokens - before.1
         ))
     }
 
@@ -122,10 +224,14 @@ impl Orchestrator {
 
     /// Cratchit reviews heuristic helper candidates and keeps only genuinely
     /// generic, reusable utilities, annotating each with a purpose line.
-    /// He may read the source to check a body when the signature is unclear.
+    /// He may read the source to check a body when the signature is unclear —
+    /// read_file is the only tool he gets for this.
     pub async fn validate_helpers(&mut self, candidates: Vec<Helper>) -> Result<Vec<Helper>> {
         const BATCH: usize = 50;
-        let defs = tools::definitions();
+        let defs: Vec<Value> = tools::definitions()
+            .into_iter()
+            .filter(|d| d["function"]["name"] == "read_file")
+            .collect();
         let mut kept = Vec::new();
         for batch in candidates.chunks(BATCH) {
             let listing = crate::helpers::render(batch);
@@ -146,7 +252,7 @@ impl Orchestrator {
             for _ in 0..20 {
                 let msg = self
                     .client
-                    .chat("cratchit", &self.cheap_model, &log, &defs)
+                    .chat("cratchit", &self.cheap_model, &log, &defs, None)
                     .await?;
                 log.push(msg.clone());
                 if let Some(calls) = msg.tool_calls.filter(|c| !c.is_empty()) {
@@ -179,12 +285,20 @@ impl Orchestrator {
 
     async fn cratchit_execute(&mut self, task: &str, plan: &str) -> Result<String> {
         let defs = tools::definitions();
+        // Inject context deterministically instead of having the model fetch
+        // it: the code map sliced to what the plan mentions, plus the full
+        // best-practice sections relevant to task + plan.
+        let context = format!("{task} {plan}");
+        let map = codemap::build(&self.toolbox.root)?.brief_for(&context);
+        let guidance = practices::relevant_sections(&context);
         let mut log = vec![
             Message::text("system", CRATCHIT_SYSTEM),
             Message::text(
                 "user",
                 format!(
-                    "PROJECT ROOT: {}\nTASK: {task}\n\nSCROOGE'S INSTRUCTIONS:\n{plan}",
+                    "PROJECT ROOT: {}\nTASK: {task}\n\nSCROOGE'S INSTRUCTIONS:\n{plan}\n\n\
+                     CODE MAP (files mentioned in the instructions shown in full):\n{map}\n\
+                     GUIDANCE:\n{guidance}",
                     self.toolbox.root.display()
                 ),
             ),
@@ -193,7 +307,7 @@ impl Orchestrator {
         for _ in 0..40 {
             let msg = self
                 .client
-                .chat("cratchit", &self.cheap_model, &log, &defs)
+                .chat("cratchit", &self.cheap_model, &log, &defs, None)
                 .await?;
             log.push(msg.clone());
             let Some(calls) = msg.tool_calls.filter(|c| !c.is_empty()) else {

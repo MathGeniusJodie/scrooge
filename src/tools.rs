@@ -132,6 +132,37 @@ pub fn definitions() -> Vec<Value> {
 
 const MAX_OUTPUT: usize = 8000;
 
+/// Whole-file reads above this are refused with an outline instead, so the
+/// "read line ranges" rule is enforced in code rather than pleaded in prompts.
+const MAX_WHOLE_FILE_LINES: usize = 400;
+
+/// Whitespace-tolerant match: byte ranges of line windows whose trimmed
+/// lines equal the trimmed lines of `find`.
+fn fuzzy_match_ranges(content: &str, find: &str) -> Vec<(usize, usize)> {
+    let needle: Vec<&str> = find.lines().map(str::trim).collect();
+    if needle.is_empty() {
+        return vec![];
+    }
+    let mut starts = vec![0usize];
+    for (i, b) in content.bytes().enumerate() {
+        if b == b'\n' {
+            starts.push(i + 1);
+        }
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    let mut out = Vec::new();
+    if lines.len() < needle.len() {
+        return out;
+    }
+    for i in 0..=lines.len() - needle.len() {
+        if (0..needle.len()).all(|j| lines[i + j].trim() == needle[j]) {
+            let last = i + needle.len() - 1;
+            out.push((starts[i], starts[last] + lines[last].len()));
+        }
+    }
+    out
+}
+
 fn truncate(mut s: String) -> String {
     if s.len() > MAX_OUTPUT {
         s.truncate(MAX_OUTPUT);
@@ -194,7 +225,8 @@ impl Toolbox {
         let s = |k: &str| args[k].as_str().unwrap_or("").to_string();
         match name {
             "read_file" => {
-                let content = std::fs::read_to_string(self.resolve(&s("path")))?;
+                let path = self.resolve(&s("path"));
+                let content = std::fs::read_to_string(&path)?;
                 let start = args["start_line"].as_u64().map(|n| n as usize);
                 let end = args["end_line"].as_u64().map(|n| n as usize);
                 Ok(match (start, end) {
@@ -208,7 +240,14 @@ impl Toolbox {
                             .collect::<Vec<_>>()
                             .join("\n")
                     }
-                    _ => content,
+                    _ => {
+                        let total = content.lines().count();
+                        if total > MAX_WHOLE_FILE_LINES {
+                            self.file_outline(&path, total)?
+                        } else {
+                            content
+                        }
+                    }
                 })
             }
             "write_file" => {
@@ -224,7 +263,23 @@ impl Toolbox {
                 let content = std::fs::read_to_string(&path)?;
                 let find = s("find");
                 match content.matches(&find).count() {
-                    0 => anyhow::bail!("string not found in {}", path.display()),
+                    0 => {
+                        // Deterministic fallback: match ignoring per-line
+                        // leading/trailing whitespace before bouncing back
+                        // to the model for another expensive retry.
+                        match fuzzy_match_ranges(&content, &find).as_slice() {
+                            [] => anyhow::bail!("string not found in {}", path.display()),
+                            [(a, b)] => {
+                                let new = format!("{}{}{}", &content[..*a], s("replace"), &content[*b..]);
+                                std::fs::write(&path, new)?;
+                                Ok("edited (whitespace-tolerant match)".into())
+                            }
+                            m => anyhow::bail!(
+                                "string matches {} places ignoring whitespace; provide more context",
+                                m.len()
+                            ),
+                        }
+                    }
                     1 => {
                         std::fs::write(&path, content.replacen(&find, &s("replace"), 1))?;
                         Ok("edited".into())
@@ -278,6 +333,23 @@ impl Toolbox {
             "best_practices" => Ok(practices::relevant_sections(&s("topic"))),
             _ => anyhow::bail!("unknown tool {name}"),
         }
+    }
+
+    /// Symbol outline returned instead of an oversized whole-file read.
+    fn file_outline(&self, path: &Path, total_lines: usize) -> Result<String> {
+        let map = codemap::build(&self.root)?;
+        let rel = path.strip_prefix(&self.root).unwrap_or(path);
+        let outline: String = map
+            .symbols
+            .iter()
+            .filter(|s| s.file == rel)
+            .map(|s| format!("  L{}-{} {}\n", s.line, s.end_line, s.signature))
+            .collect();
+        Ok(format!(
+            "{} is {total_lines} lines — too large to read whole; request a \
+             start_line/end_line range instead. Outline:\n{outline}",
+            rel.display()
+        ))
     }
 
     async fn run(&self, prog: &str, args: &[&str]) -> Result<String> {
@@ -434,6 +506,17 @@ mod tests {
             "sandbox escape: wrote {target}"
         );
         assert!(out.contains("[exit"), "expected failure, got: {out}");
+    }
+
+    #[test]
+    fn fuzzy_match_ignores_indentation() {
+        let content = "fn a() {\n    let x = 1;\n    let y = 2;\n}\n";
+        let find = "let x = 1;\nlet y = 2;";
+        let ranges = fuzzy_match_ranges(content, find);
+        assert_eq!(ranges.len(), 1);
+        let (a, b) = ranges[0];
+        assert_eq!(&content[a..b], "    let x = 1;\n    let y = 2;");
+        assert!(fuzzy_match_ranges(content, "let z = 3;").is_empty());
     }
 
     #[tokio::test]

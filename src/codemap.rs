@@ -379,18 +379,60 @@ fn name_matches(qualified: &str, query: &str) -> bool {
 }
 
 impl CodeMap {
-    /// Compact brief: one line per file, then symbols grouped by file.
-    /// Designed to be the cheapest faithful overview of a codebase.
-    pub fn brief(&self) -> String {
+    /// Symbols grouped by file, impl blocks dropped (their methods already
+    /// carry the impl name as a prefix).
+    fn by_file(&self) -> BTreeMap<&Path, Vec<&Symbol>> {
         let mut by_file: BTreeMap<&Path, Vec<&Symbol>> = BTreeMap::new();
         for s in &self.symbols {
+            if matches!(s.kind, SymbolKind::Impl) {
+                continue;
+            }
             by_file.entry(&s.file).or_default().push(s);
         }
+        by_file
+    }
+
+    fn file_line(file: &Path, syms: &[&Symbol]) -> String {
+        let packed = syms
+            .iter()
+            .map(|s| format!("{} {}@{}", s.kind.short(), s.name, s.line))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{}: {packed}\n", file.display())
+    }
+
+    /// Compact brief: one packed line per file.
+    /// Designed to be the cheapest faithful overview of a codebase.
+    pub fn brief(&self) -> String {
+        self.by_file()
+            .into_iter()
+            .map(|(file, syms)| Self::file_line(file, &syms))
+            .collect()
+    }
+
+    /// Brief sliced to what `text` (task + plan) mentions: files whose path
+    /// or symbols appear in the text get full listings, the rest contribute
+    /// only their file name so the overall shape stays visible.
+    pub fn brief_for(&self, text: &str) -> String {
+        let text = text.to_lowercase();
         let mut out = String::new();
-        for (file, syms) in by_file {
-            out.push_str(&format!("{}\n", file.display()));
-            for s in syms {
-                out.push_str(&format!("  {} {} L{}\n", s.kind.short(), s.name, s.line));
+        for (file, syms) in self.by_file() {
+            let path = file.display().to_string().to_lowercase();
+            let stem = file
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            let relevant = text.contains(&path)
+                || (!stem.is_empty() && text.contains(&stem))
+                || syms.iter().any(|s| {
+                    let bare = s.name.rsplit('.').next().unwrap_or(&s.name);
+                    bare.len() > 2 && text.contains(&bare.to_lowercase())
+                });
+            if relevant {
+                out.push_str(&Self::file_line(file, &syms));
+            } else {
+                out.push_str(&format!("{}\n", file.display()));
             }
         }
         out
