@@ -53,6 +53,16 @@ except Exception:
     sys.exit(0)  # never trap the user in a broken hook
 
 if result.returncode == 0:
+    # Code was written this session (the dirty flag got us here) and checks
+    # are green: have Cratchit reconsider .scrooge/overview.md against the
+    # diff and rewrite it if stale. Best-effort — never blocks the stop.
+    try:
+        subprocess.run(
+            [binary, "-r", cwd, "refresh-overview"],
+            capture_output=True, timeout=300,
+        )
+    except Exception:
+        pass
     finish(clean=True)
 
 next_attempt = attempts() + 1

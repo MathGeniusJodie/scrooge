@@ -44,6 +44,14 @@ enum Cmd {
     McpServe,
     /// Print best-practice sections matching the given text (for hooks).
     Practices { text: String },
+    /// Have Cratchit review .scrooge/overview.md against the current diff
+    /// and rewrite it if stale (written from scratch if missing). Run by the
+    /// plugin's Stop hook after a session that changed code.
+    RefreshOverview {
+        /// Task context for the review, optional.
+        #[arg(default_value = "the changes made in this session")]
+        task: String,
+    },
     /// Run the post-task verification pass: autoformat, tests, lint autofix.
     /// Commands come from .scrooge/checks.toml (created with per-language
     /// defaults on first run). Exit code: 0 clean, 1 errors, 2 warnings.
@@ -80,6 +88,14 @@ async fn main() -> Result<()> {
         }
         Cmd::McpServe => mcp::Server::new(root).run().await?,
         Cmd::Practices { text } => print!("{}", practices::relevant_sections(&text)),
+        Cmd::RefreshOverview { task } => {
+            let mut orch = agents::Orchestrator::new(root.clone())?;
+            if overview::load(&root).is_some() {
+                orch.refresh_overview(&task).await;
+            } else {
+                orch.ensure_overview(&task).await?;
+            }
+        }
         Cmd::Check => {
             let report = checks::run(&root)?;
             print!("{}", checks::render(&report));

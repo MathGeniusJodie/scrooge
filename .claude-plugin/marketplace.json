@@ -1,0 +1,11 @@
+{
+  "name": "scrooge-local",
+  "owner": { "name": "Jodie" },
+  "plugins": [
+    {
+      "name": "scrooge",
+      "source": "./plugin",
+      "description": "Token-miserly coding: Claude plans from compact code-map briefs and dispatches legwork to Cratchit, a cheap model."
+    }
+  ]
+}

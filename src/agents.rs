@@ -423,7 +423,7 @@ impl Orchestrator {
     /// files to characterize a codebase is exactly the token-heavy legwork
     /// that must never land on Scrooge. The file stays user-editable and is
     /// injected verbatim into every briefing from then on.
-    async fn ensure_overview(&mut self, task: &str) -> Result<String> {
+    pub async fn ensure_overview(&mut self, task: &str) -> Result<String> {
         let root = self.toolbox.root.clone();
         if let Some(text) = crate::overview::load(&root) {
             return Ok(text);
@@ -469,7 +469,7 @@ impl Orchestrator {
     /// overview against the diff; he edits .scrooge/overview.md himself when
     /// it has gone stale. Best-effort — a failure here must never tarnish a
     /// task that already completed.
-    async fn refresh_overview(&mut self, task: &str) {
+    pub async fn refresh_overview(&mut self, task: &str) {
         let root = self.toolbox.root.clone();
         if crate::overview::load(&root).is_none() {
             return; // nothing on file to go stale
@@ -500,8 +500,8 @@ impl Orchestrator {
     fn bill(&self, round: usize) -> String {
         let u = &self.client.usage;
         format!(
-            "task complete in {round} round(s). tokens: {} in / {} out",
-            u.prompt_tokens, u.completion_tokens
+            "task complete in {round} round(s). tokens: {} in / {} out (${:.4})",
+            u.prompt_tokens, u.completion_tokens, u.cost_usd
         )
     }
 
@@ -600,13 +600,15 @@ impl Orchestrator {
         let before = (
             self.client.usage.prompt_tokens,
             self.client.usage.completion_tokens,
+            self.client.usage.cost_usd,
         );
         let (report, _) = self.execute_and_verify(task, instructions, None).await?;
         let u = &self.client.usage;
         Ok(format!(
-            "{report}\n[cratchit tokens: {} in / {} out]",
+            "{report}\n[cratchit tokens: {} in / {} out (${:.4})]",
             u.prompt_tokens - before.0,
-            u.completion_tokens - before.1
+            u.completion_tokens - before.1,
+            u.cost_usd - before.2
         ))
     }
 

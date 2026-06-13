@@ -1,0 +1,153 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="940" height="1210" viewBox="0 0 940 1210" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#334"/>
+    </marker>
+  </defs>
+  <style>
+    .box { fill:#eef2fb; stroke:#334; stroke-width:1.2; rx:6; }
+    .side { fill:#fdf3e3; stroke:#875; stroke-width:1.2; rx:6; }
+    .diamond { fill:#e8f7ea; stroke:#363; stroke-width:1.2; }
+    .t { font-size:13px; font-weight:bold; fill:#112; text-anchor:middle; }
+    .s { font-size:11px; font-style:italic; fill:#556; text-anchor:middle; }
+    .l { font-size:11px; fill:#334; }
+    .edge { stroke:#334; stroke-width:1.3; fill:none; marker-end:url(#arrow); }
+    .loop { stroke:#a33; stroke-width:1.3; fill:none; marker-end:url(#arrow); stroke-dasharray:5 3; }
+  </style>
+
+  <text x="470" y="26" text-anchor="middle" font-size="17" font-weight="bold" fill="#112">scrooge run — pipeline</text>
+
+  <!-- CLI -->
+  <rect class="box" x="290" y="44" width="360" height="48" rx="6"/>
+  <text class="t" x="470" y="64">CLI entry</text>
+  <text class="s" x="470" y="82">main.rs → Cli / main()</text>
+
+  <!-- run_task -->
+  <rect class="box" x="290" y="122" width="360" height="48" rx="6"/>
+  <text class="t" x="470" y="142">Task loop</text>
+  <text class="s" x="470" y="160">agents.rs → Orchestrator::run_task()</text>
+
+  <!-- context -->
+  <rect class="box" x="250" y="200" width="440" height="78" rx="6"/>
+  <text class="t" x="470" y="220">Deterministic context (zero LLM tokens)</text>
+  <text class="s" x="470" y="238">agents.rs → ensure_overview() · overview.rs → load()/save()</text>
+  <text class="s" x="470" y="254">codemap.rs → build_cached() / brief() / brief_for()</text>
+  <text class="s" x="470" y="270">practices.rs → summary()</text>
+
+  <!-- scrooge plans -->
+  <rect class="box" x="290" y="308" width="360" height="62" rx="6"/>
+  <text class="t" x="470" y="330">Scrooge plans / reviews (≤700 tok)</text>
+  <text class="s" x="470" y="347">agents.rs → client.chat("scrooge")</text>
+  <text class="s" x="470" y="362">openrouter.rs → Client::chat()</text>
+
+  <!-- DONE diamond -->
+  <polygon class="diamond" points="470,400 565,438 470,476 375,438"/>
+  <text class="t" x="470" y="434">reply is</text>
+  <text class="t" x="470" y="450">DONE?</text>
+
+  <!-- bill -->
+  <rect class="box" x="660" y="414" width="250" height="48" rx="6"/>
+  <text class="t" x="785" y="434">Refresh overview, bill, exit</text>
+  <text class="s" x="785" y="452">agents.rs → refresh_overview() / bill()</text>
+
+  <!-- synthesized fix -->
+  <rect class="side" x="30" y="414" width="250" height="48" rx="6"/>
+  <text class="t" x="155" y="434">Synthesize fix step</text>
+  <text class="s" x="155" y="452">agents.rs → run_task() done_pending</text>
+
+  <!-- plan_steps -->
+  <rect class="box" x="290" y="506" width="360" height="48" rx="6"/>
+  <text class="t" x="470" y="526">Split plan into steps</text>
+  <text class="s" x="470" y="544">agents.rs → plan_steps()</text>
+
+  <!-- execute_and_verify -->
+  <rect class="box" x="290" y="584" width="360" height="48" rx="6"/>
+  <text class="t" x="470" y="604">Execute &amp; verify (per step, fresh Cratchit)</text>
+  <text class="s" x="470" y="622">agents.rs → execute_and_verify()</text>
+
+  <!-- cratchit loop -->
+  <rect class="box" x="290" y="662" width="360" height="62" rx="6"/>
+  <text class="t" x="470" y="684">Cratchit tool loop (≤40 iters)</text>
+  <text class="s" x="470" y="701">agents.rs → cratchit_execute() → tool_loop()</text>
+  <text class="s" x="470" y="716">evict_old_tool_results()</text>
+
+  <!-- toolbox side -->
+  <rect class="side" x="690" y="650" width="230" height="86" rx="6"/>
+  <text class="t" x="805" y="670">Tools (Landlock-sandboxed)</text>
+  <text class="s" x="805" y="688">tools.rs → Toolbox::dispatch()</text>
+  <text class="s" x="805" y="703">read/edit/replace_symbol · shell ·</text>
+  <text class="s" x="805" y="718">python · query_docs · helpers …</text>
+
+  <!-- clamp -->
+  <rect class="box" x="290" y="754" width="360" height="44" rx="6"/>
+  <text class="t" x="470" y="772">Clamp report (≤12 lines / 1200 chars)</text>
+  <text class="s" x="470" y="789">agents.rs → clamp_report()</text>
+
+  <!-- diff diamond -->
+  <polygon class="diamond" points="470,828 575,864 470,900 365,864"/>
+  <text class="t" x="470" y="860">files changed?</text>
+  <text class="s" x="470" y="876">agents.rs → worktree_changes()</text>
+
+  <!-- checks -->
+  <rect class="box" x="290" y="930" width="360" height="62" rx="6"/>
+  <text class="t" x="470" y="952">Check suite: format → test → lint-fix → lint</text>
+  <text class="s" x="470" y="969">checks.rs → run() / load() / run_cmd()</text>
+  <text class="s" x="470" y="984">config: .scrooge/checks.toml</text>
+
+  <!-- append -->
+  <rect class="box" x="290" y="1022" width="360" height="44" rx="6"/>
+  <text class="t" x="470" y="1040">Append CHANGED + CHECKS lines</text>
+  <text class="s" x="470" y="1057">agents.rs → execute_and_verify()</text>
+
+  <!-- digest -->
+  <rect class="box" x="290" y="1096" width="360" height="44" rx="6"/>
+  <text class="t" x="470" y="1114">Digest step reports for Scrooge</text>
+  <text class="s" x="470" y="1131">agents.rs → digest_steps()</text>
+
+  <!-- MCP note -->
+  <rect class="side" x="30" y="1160" width="880" height="38" rx="6"/>
+  <text class="l" x="470" y="1184" text-anchor="middle">Plugin/MCP mode: Claude conversation plays Scrooge — mcp.rs → Server::call_tool() · give_cratchit_task → agents.rs → delegate() → execute_and_verify() · hooks: session_start.py (map) · prompt_submit.py (practices) · stop.py (scrooge check)</text>
+
+  <!-- main vertical edges -->
+  <line class="edge" x1="470" y1="92"  x2="470" y2="120"/>
+  <line class="edge" x1="470" y1="170" x2="470" y2="198"/>
+  <line class="edge" x1="470" y1="278" x2="470" y2="306"/>
+  <line class="edge" x1="470" y1="370" x2="470" y2="398"/>
+  <line class="edge" x1="470" y1="476" x2="470" y2="504"/>
+  <text class="l" x="480" y="496">no: numbered plan</text>
+  <line class="edge" x1="470" y1="554" x2="470" y2="582"/>
+  <line class="edge" x1="470" y1="632" x2="470" y2="660"/>
+  <line class="edge" x1="470" y1="724" x2="470" y2="752"/>
+  <line class="edge" x1="470" y1="798" x2="470" y2="826"/>
+  <line class="edge" x1="470" y1="900" x2="470" y2="928"/>
+  <text class="l" x="480" y="920">yes</text>
+  <line class="edge" x1="470" y1="992" x2="470" y2="1020"/>
+  <text class="l" x="480" y="1012">verdict</text>
+  <line class="edge" x1="470" y1="1066" x2="470" y2="1094"/>
+
+  <!-- DONE & green -> bill -->
+  <line class="edge" x1="565" y1="438" x2="658" y2="438"/>
+  <text class="l" x="572" y="430">yes &amp; checks green</text>
+
+  <!-- DONE & red -> synth -> plan_steps -->
+  <line class="edge" x1="375" y1="438" x2="282" y2="438"/>
+  <text class="l" x="287" y="430">yes, checks red</text>
+  <path class="edge" d="M155,462 L155,530 L288,530"/>
+
+  <!-- changed? no -> bypass checks -->
+  <path class="edge" d="M575,864 L640,864 L640,1044 L652,1044"/>
+  <text class="l" x="585" y="856">no: skip checks</text>
+
+  <!-- cratchit <-> tools -->
+  <line class="edge" x1="650" y1="683" x2="688" y2="683"/>
+  <line class="edge" x1="688" y1="703" x2="650" y2="703"/>
+
+  <!-- checks fail retry loop -->
+  <path class="loop" d="M290,961 L230,961 L230,693 L288,693"/>
+  <text class="l" x="120" y="830" fill="#a33">checks fail: retry (≤2)</text>
+
+  <!-- review round loop -->
+  <path class="loop" d="M290,1118 L100,1118 L100,339 L288,339"/>
+  <text class="l" x="40" y="700" fill="#a33">next review</text>
+  <text class="l" x="40" y="715" fill="#a33">round (≤5)</text>
+</svg>

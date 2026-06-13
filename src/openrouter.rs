@@ -58,6 +58,8 @@ pub struct FunctionCall {
 pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// Cumulative cost in USD, as reported by OpenRouter (`usage.cost`).
+    pub cost_usd: f64,
 }
 
 pub struct Client {
@@ -97,6 +99,8 @@ impl Client {
         let mut body = serde_json::json!({
             "model": model,
             "messages": messages,
+            // Ask OpenRouter to report the actual dollar cost in `usage.cost`.
+            "usage": { "include": true },
         });
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools.to_vec());
@@ -147,9 +151,11 @@ impl Client {
                 u["prompt_tokens"].as_u64().unwrap_or(0),
                 u["completion_tokens"].as_u64().unwrap_or(0),
             );
+            let cost = u["cost"].as_f64().unwrap_or(0.0);
             self.usage.prompt_tokens += p;
             self.usage.completion_tokens += c;
-            accounting::record(&self.root, agent, model, p, c);
+            self.usage.cost_usd += cost;
+            accounting::record(&self.root, agent, model, p, c, cost, &body, &v);
         }
         self.last_finish_reason = v["choices"][0]["finish_reason"]
             .as_str()
