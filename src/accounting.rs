@@ -1,7 +1,7 @@
 //! Token bookkeeping, in the spirit of the house: every LLM call is entered
-//! in .scrooge/accounts.log — header line plus the input prompt and the
-//! model's text output (intermediate tool calls and their results are left
-//! out to keep the ledger readable) — and running per-agent totals are kept
+//! in .scrooge/accounts.log — header line plus the user prompt and the
+//! model's text answer (the system prompt, tool calls, and their results
+//! are left out to keep the ledger readable) — and running per-agent totals are kept
 //! in .scrooge/ledger.json. Best-effort by design — bookkeeping must never
 //! fail a chat call.
 
@@ -10,20 +10,18 @@ use std::fmt::Write as _;
 use std::io::Write;
 use std::path::Path;
 
-/// The prompt as sent, minus the tool-call bookkeeping: tool-result messages
-/// are dropped and assistant `tool_calls` are ignored, leaving just the text
-/// each role contributed.
+/// Just the user prompt(s): the system prompt, assistant turns, and
+/// tool-result messages are all dropped, leaving only what the user asked.
 fn prompt_text(request: &Value) -> String {
     let mut out = String::new();
     for msg in request["messages"].as_array().into_iter().flatten() {
-        let role = msg["role"].as_str().unwrap_or("");
-        if role == "tool" {
+        if msg["role"].as_str() != Some("user") {
             continue;
         }
         if let Some(content) = msg["content"].as_str()
             && !content.is_empty()
         {
-            let _ = write!(out, "[{role}]\n{content}\n");
+            let _ = writeln!(out, "{content}");
         }
     }
     out
