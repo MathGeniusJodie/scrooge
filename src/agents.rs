@@ -361,6 +361,9 @@ impl Orchestrator {
     /// task-relevant files on review rounds when large) + one-line digests of
     /// earlier rounds + only the latest plan/report, so his prompt does not
     /// grow with superseded history.
+    // TODO(scrooge): spec a refactor splitting the plan/execute/review phases
+    // into helpers; allowed for now so the lint stays enforced elsewhere.
+    #[allow(clippy::too_many_lines)]
     pub async fn run_task(&mut self, task: &str) -> Result<String> {
         // Deterministic, zero-token context gathering. The overview is the
         // one piece Cratchit writes first if missing — what the project *is*

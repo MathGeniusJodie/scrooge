@@ -30,6 +30,8 @@ fn obj(props: &Value, required: &[&str]) -> Value {
 /// `code_map` and `best_practices` bodies are no longer listed: both are
 /// injected into Cratchit's briefing deterministically (the handlers remain
 /// callable for other entry points).
+// A flat data table of tool schemas — long by nature, not a refactor target.
+#[allow(clippy::too_many_lines)]
 pub fn definitions() -> Vec<Value> {
     vec![
         tool(
@@ -388,14 +390,14 @@ impl Toolbox {
     /// nothing is written unless every edit succeeds, so a failure report
     /// always means "file untouched".
     async fn edit_file(&self, args: &Value) -> Result<String> {
-        let path = self.resolve_write(args["path"].as_str().unwrap_or(""))?;
-        let mut content = std::fs::read_to_string(&path)?;
-
         struct E {
             find: String,
             replace: String,
             all: bool,
         }
+        let path = self.resolve_write(args["path"].as_str().unwrap_or(""))?;
+        let mut content = std::fs::read_to_string(&path)?;
+
         // Array form is canonical; the legacy single find/replace form is
         // still accepted so a confused model isn't hard-stuck.
         let edits: Vec<E> = args["edits"].as_array().map_or_else(

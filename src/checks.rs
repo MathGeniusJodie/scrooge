@@ -49,7 +49,10 @@ const RUFF_RULES: &str = "E,W,I,N,UP,B,SIM,C4,PERF,RUF,PL,TID,PTH";
 // Clippy lint groups beyond the default: pedantic catches common correctness
 // and style issues; nursery holds promising lints still under development.
 // A handful of pedantic lints are suppressed because they produce false
-// positives or are incompatible with typical project structures.
+// positives or are incompatible with typical project structures. The
+// refactor-heavy ones (too_many_lines, items_after_statements) are left
+// *enabled* so new violations fail the build; any existing offender carries
+// a localized #[allow(...)] tagged for Scrooge to spec a proper refactor.
 const CLIPPY_LINTS: &str = "-D warnings \
     -W clippy::pedantic \
     -W clippy::nursery \
@@ -59,8 +62,6 @@ const CLIPPY_LINTS: &str = "-D warnings \
     -A clippy::missing_panics_doc \
     -A clippy::too_many_arguments \
     -A clippy::unused_async \
-    -A clippy::too_many_lines \
-    -A clippy::items_after_statements \
     -A clippy::cast_possible_truncation";
 
 /// Built-in defaults for whatever languages the repo actually contains.

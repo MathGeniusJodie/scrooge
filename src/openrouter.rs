@@ -96,6 +96,9 @@ impl Client {
         tools: &[Value],
         max_tokens: Option<u32>,
     ) -> Result<Message> {
+        // Retry transient failures (429 / 5xx / transport errors) with
+        // backoff: one network blip must not discard a whole task's tokens.
+        const RETRIES: u32 = 3;
         let mut body = serde_json::json!({
             "model": model,
             "messages": messages,
@@ -108,9 +111,6 @@ impl Client {
         if let Some(cap) = max_tokens {
             body["max_tokens"] = serde_json::json!(cap);
         }
-        // Retry transient failures (429 / 5xx / transport errors) with
-        // backoff: one network blip must not discard a whole task's tokens.
-        const RETRIES: u32 = 3;
         let mut attempt = 0;
         let v: Value = loop {
             attempt += 1;
