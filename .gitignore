@@ -3,3 +3,4 @@
 /.scrooge/check_attempts
 /.scrooge/accounts.log
 /.scrooge/ledger.json
+/plugin/bin/scrooge
