@@ -9,6 +9,8 @@ writes code. **Cratchit** (cheap model) does all the work.
 override with
 `SCROOGE_MODEL` and `CRATCHIT_MODEL` env vars. Requires `OPENROUTER_API_KEY`.
 
+Currently supports rust, python and html/css/js. lua support is planned.
+
 ## Usage
 
 ```sh
@@ -20,7 +22,7 @@ scrooge callers <fn> / scrooge callees <fn>      # call-graph queries
 scrooge -r path/to/project ...                   # operate on another project
 scrooge helpers                                  # generic utilities in the repo (heuristic, free)
 scrooge helpers --deps --validate                # + all dependencies, filtered by Cratchit
-
+scrooge humbugs                                  # find every humbug: format, tests, lint
 ```
 
 ## Claude Code plugin mode

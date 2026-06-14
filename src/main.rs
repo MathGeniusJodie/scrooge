@@ -56,6 +56,9 @@ enum Cmd {
     /// Commands come from .scrooge/checks.toml (created with per-language
     /// defaults on first run). Exit code: 0 clean, 1 errors, 2 warnings.
     Check,
+    /// Hunt down every humbug: run the full check suite (format, tests, lint).
+    /// Alias for `check`. Exit code: 0 clean, 1 errors, 2 warnings.
+    Humbugs,
     /// Find generic utility/helper functions in the repo (and dependencies
     /// with --deps), so agents reuse instead of reinventing. Results are
     /// cached in .scrooge/helpers.json and served by the `helpers` tool.
@@ -96,7 +99,7 @@ async fn main() -> Result<()> {
                 orch.ensure_overview(&task).await?;
             }
         }
-        Cmd::Check => {
+        Cmd::Check | Cmd::Humbugs => {
             let report = checks::run(&root)?;
             print!("{}", checks::render(&report));
             if !report.errors.is_empty() {
