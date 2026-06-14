@@ -213,6 +213,9 @@ pub fn run(root: &Path) -> Result<Report> {
 
 pub fn render(report: &Report) -> String {
     let mut s = String::new();
+    if !report.errors.is_empty() || !report.warnings.is_empty() {
+        s.push_str("Bah! Humbug!\n");
+    }
     for (lang, out) in &report.errors {
         write!(s, "== {lang}: tests/build FAILED ==\n{out}\n").unwrap();
     }

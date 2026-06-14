@@ -16,7 +16,14 @@ use std::path::PathBuf;
 /// Scrooge: a token-miserly coding agent. Scrooge (SOTA model) plans from
 /// compact briefs; Cratchit (cheap model) does the legwork with tools.
 #[derive(Parser)]
-#[command(name = "scrooge", version)]
+#[command(
+    name = "scrooge",
+    version,
+    long_about = "Scrooge: a token-miserly coding agent.\n\n\
+        \"I'll not spend a farthing more than I must.\"\n\n\
+        Scrooge (SOTA model) plans from compact briefs; Cratchit (cheap model) \
+        does the legwork with tools."
+)]
 struct Cli {
     /// Project root to operate on.
     #[arg(short, long, default_value = ".")]
