@@ -220,7 +220,7 @@ pub fn render(report: &Report) -> String {
         write!(s, "== {lang}: warnings remain after autofix ==\n{out}\n").unwrap();
     }
     if s.is_empty() {
-        s.push_str("all checks clean\n");
+        s.push_str("God bless us, every one! (all checks clean)\n");
     }
     s
 }
