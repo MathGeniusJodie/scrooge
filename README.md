@@ -1,6 +1,6 @@
 # scrooge coding agent
 
-![scrooge logo](https://raw.githubusercontent.com/MathGeniusJodie/scrooge/master/logo.png)
+![scrooge logo](https://github.com/MathGeniusJodie/scrooge/blob/master/logo.png?raw=true)
 
 A token-miserly coding agent. **Scrooge** (expensive SOTA model) only ever sees
 terse briefs and reports. He plans and reviews, never reads files or
