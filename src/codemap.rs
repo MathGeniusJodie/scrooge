@@ -492,6 +492,26 @@ impl CodeMap {
         format!("{}: {packed}\n", file.display())
     }
 
+    /// Best-practice keyword tags for every language present in the codebase,
+    /// derived from file extensions. Used to select language guidance by what
+    /// the project *is*, rather than by whether the task text happens to name
+    /// the language (it almost never does).
+    pub fn languages(&self) -> Vec<&'static str> {
+        let mut tags: Vec<&'static str> = Vec::new();
+        for s in &self.symbols {
+            let tag = match lang_for(&s.file) {
+                Some(Lang::Rust) => "rust",
+                Some(Lang::Python) => "python",
+                Some(Lang::Js | Lang::Html) => "javascript",
+                None => continue,
+            };
+            if !tags.contains(&tag) {
+                tags.push(tag);
+            }
+        }
+        tags
+    }
+
     /// Compact brief: one packed line per file.
     /// Designed to be the cheapest faithful overview of a codebase.
     pub fn brief(&self) -> String {

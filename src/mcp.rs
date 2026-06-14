@@ -187,7 +187,10 @@ impl Server {
                     .callees_of(&s("name"))
                     .join("\n"),
             )),
-            "best_practices" => Ok(practices::relevant_sections(&s("topic"))),
+            "best_practices" => Ok(practices::relevant_sections(
+                &s("topic"),
+                &codemap::build_cached(&self.root)?.languages(),
+            )),
             "helpers" => helpers::filtered_listing(&self.root, &s("filter")),
             "give_cratchit_task" => {
                 let (task, instructions) = (s("task"), s("instructions"));

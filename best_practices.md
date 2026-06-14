@@ -2,20 +2,20 @@
 
 Sections are matched by keywords in brackets; only relevant ones are sent to the agent.
 
-## rust [rust, cargo, crate, borrow, lifetime]
+## rust [rust, cargo, crate, borrow, lifetime, .rs]
 - Prefer `?` over unwrap; use `anyhow::Result` in binaries, `thiserror` in libraries.
 - Don't clone to satisfy the borrow checker until you've tried restructuring.
 - Minimize allocations.
 
-## python [python, pip, venv, pytest]
+## python [python, pip, venv, pytest, .py]
 - Use type hints on public functions.
 - Run code through `python3 -m py_compile` before declaring done; run pytest if tests exist.
 - Prefer stdlib over new dependencies.
 
-## javascript [javascript, html, dom, browser, node]
+## javascript [javascript, html, dom, browser, node, .js, .ts, .html, .css]
 - Prefer vanilla DOM APIs over adding libraries.
 - Use `const`/`let`, never `var`. Use strict equality.
-- Test in the actual runtime (node or browser) before declaring done.
+- Proper ARIA spec compliance
 
 ## testing [test, tests, pytest, assert, coverage]
 - Write the failing test first when fixing a bug.

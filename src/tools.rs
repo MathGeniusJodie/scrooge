@@ -396,7 +396,10 @@ impl Toolbox {
                 let dev = args["dev"].as_bool().unwrap_or(false);
                 self.add_dependency(&s("lang"), &s("package"), dev).await
             }
-            "best_practices" => Ok(practices::relevant_sections(&s("topic"))),
+            "best_practices" => Ok(practices::relevant_sections(
+                &s("topic"),
+                &crate::codemap::build_cached(&self.root)?.languages(),
+            )),
             _ => anyhow::bail!("unknown tool {name}"),
         }
     }

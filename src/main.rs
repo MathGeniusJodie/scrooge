@@ -106,7 +106,10 @@ async fn main() -> Result<()> {
             println!("{out}{}", orch.wages_footer());
         }
         Cmd::McpServe => mcp::Server::new(root).run().await?,
-        Cmd::Practices { text } => print!("{}", practices::relevant_sections(&text)),
+        Cmd::Practices { text } => print!(
+            "{}",
+            practices::relevant_sections(&text, &codemap::build_cached(&root)?.languages())
+        ),
         Cmd::RefreshOverview { task } => {
             let mut orch = agents::Orchestrator::new(root.clone())?;
             if overview::load(&root).is_some() {

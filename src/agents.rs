@@ -70,10 +70,11 @@ no restating the plan, no code unless a decision depends on it.";
 // the wording stays in one place and the methods only assemble values.
 
 /// Per-round briefing for Scrooge. Placeholders: {TASK} {OVERVIEW} {BRIEF}
-/// {GUIDANCE}.
+/// {CONTEXT} {GUIDANCE}.
 const SCROOGE_BRIEF: &str = "\
 TASK: {TASK}\n\nPROJECT OVERVIEW:\n{OVERVIEW}\n\n\
-CODEBASE BRIEF:\n{BRIEF}\nKEY GUIDANCE:\n{GUIDANCE}";
+CODEBASE BRIEF:\n{BRIEF}\nCONTEXT GATHERED BY CRATCHIT:\n{CONTEXT}\n\
+KEY GUIDANCE:\n{GUIDANCE}";
 
 /// Briefing for a fresh Cratchit. Placeholders: {ROOT} {TASK} {OVERVIEW}
 /// {PLAN} {PREV} {MAP} {GUIDANCE}.
@@ -100,6 +101,19 @@ verify.\n{FAILURES}";
 const CHECK_FAILURE_INSTRUCTIONS: &str = "\
 The deterministic check suite failed after your last changes. Fix the \
 failures below, then verify.\n{FAILURES}";
+
+/// Pre-planning context pass. Cratchit reads whatever the task actually
+/// touches and hands Scrooge the file-level facts the symbol map cannot
+/// carry, so Scrooge plans informed instead of spending a round directing
+/// Cratchit to read files. Placeholder: {TASK}.
+const CONTEXT_INSTRUCTIONS: &str = "\
+Scrooge is about to plan this task, but he sees only a compact symbol map — \
+never file contents. Your job is to pre-filter his context: read the files this \
+task touches (and any config/manifest/doc/README it implies) and report the \
+concrete facts that would shape the plan — the current contents or structure of \
+the relevant file(s), conventions already in play, and anything surprising. Quote \
+the small snippets that matter. Do NOT modify any files and do NOT propose a plan \
+yourself. Your final message is for Scrooge: facts only, no pleasantries.";
 
 /// Instruction to write the overview for a brand-new project (no code yet).
 /// Placeholder: {TASK}.
@@ -187,6 +201,11 @@ const MAX_REPORT_CHARS: usize = 1200;
 /// How much of a check-failure dump Scrooge sees. Cratchit already got the
 /// full output during the retry loop; Scrooge only needs the gist.
 const MAX_FAIL_CHARS: usize = 600;
+
+/// Cap on the pre-planning context digest Cratchit hands Scrooge. Roomier than
+/// a report (it carries quoted file snippets) but still bounded so the cheap
+/// model can't bloat every Scrooge briefing.
+const MAX_CONTEXT_CHARS: usize = 2500;
 
 /// Full briefs larger than this are sliced to task-relevant files on review
 /// rounds (round 1 always gets the full brief — Scrooge is planning then).
@@ -382,7 +401,12 @@ impl Orchestrator {
         let overview = self.ensure_overview(task).await?;
         let map = codemap::build_cached(&self.toolbox.root)?;
         let full_brief = map.brief();
-        let guidance = practices::summary(task);
+        let guidance = practices::summary(task, &map.languages());
+        // Cratchit pre-filters Scrooge's context: he reads the files the task
+        // touches and hands up the file-level facts the symbol map can't carry,
+        // so Scrooge's first plan is informed rather than spending a round
+        // directing Cratchit to read files.
+        let context = self.gather_context(task).await?;
 
         let mut digests: Vec<String> = Vec::new();
         let mut last_plan: Option<String> = None;
@@ -407,6 +431,7 @@ impl Orchestrator {
                         .replace("{TASK}", task)
                         .replace("{OVERVIEW}", &overview)
                         .replace("{BRIEF}", &brief)
+                        .replace("{CONTEXT}", &context)
                         .replace("{GUIDANCE}", &guidance),
                 ),
             ];
@@ -540,6 +565,23 @@ impl Orchestrator {
             "wrote {} (edit freely; it is sent with every briefing)",
             crate::overview::path(&root).display()
         );
+        Ok(text)
+    }
+
+    /// Pre-planning context pass: a fresh Cratchit reads what the task touches
+    /// and returns the file-level facts the symbol map can't carry, bounded so
+    /// it can't bloat every Scrooge briefing. Read-only — the same tool set the
+    /// overview passes use, so Cratchit can't write code while reconnoitring.
+    async fn gather_context(&mut self, task: &str) -> Result<String> {
+        eprintln!("--- cratchit gathering context for scrooge ---");
+        let text = self
+            .cratchit_execute_with(task, CONTEXT_INSTRUCTIONS, None, Self::overview_tools())
+            .await?;
+        let mut text = text.trim().to_string();
+        if text.len() > MAX_CONTEXT_CHARS {
+            text.truncate(floor_char_boundary(&text, MAX_CONTEXT_CHARS));
+            text.push_str("\n[context clamped]");
+        }
         Ok(text)
     }
 
@@ -898,8 +940,9 @@ impl Orchestrator {
         // best-practice sections relevant to task + plan, and the previous
         // round's report so already-paid-for findings aren't re-investigated.
         let context = format!("{task} {plan}");
-        let map = codemap::build_cached(&self.toolbox.root)?.brief_for(&context);
-        let guidance = practices::relevant_sections(&context);
+        let full_map = codemap::build_cached(&self.toolbox.root)?;
+        let map = full_map.brief_for(&context);
+        let guidance = practices::relevant_sections(&context, &full_map.languages());
         // Loaded, never generated, here — ensure_overview() itself runs
         // through cratchit_execute, so generating would recurse.
         let overview = crate::overview::load(&self.toolbox.root)
