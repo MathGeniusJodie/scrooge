@@ -124,16 +124,20 @@ saved verbatim as overview.md.";
 const OVERVIEW_REFRESH_INSTRUCTIONS: &str = "\
 The task above is complete. Review the PROJECT OVERVIEW in your \
 briefing against what changed:\n{CHANGED}\n\n\
-If the overview's description of purpose or architecture is now \
-stale, rewrite .scrooge/overview.md (write_file or edit_file): \
-first line — what the project is in one sentence, then one short \
-prose paragraph on architecture and non-obvious invariants, at \
-most 15 lines. If it is still accurate, change NOTHING. Report \
-one line: 'overview updated: <what changed>' or 'overview \
-unchanged'.";
+Decide whether the overview's description of purpose or architecture \
+is now stale. Do NOT modify any files. Your final message must be \
+EITHER the single word UNCHANGED (if it is still accurate), OR the \
+full rewritten overview — first line: what the project is in one \
+sentence, then one short prose paragraph on architecture and \
+non-obvious invariants, at most 15 lines. Output ONLY that, nothing else.";
 
 /// Framing for the one-shot `ask` entry point.
 const ASK_INSTRUCTIONS: &str = "Answer the question directly; investigate with tools first.";
+
+/// Tools withheld while generating or refreshing the overview: Cratchit must
+/// return the overview as its final message (the orchestrator saves it), never
+/// write the file itself. `shell` is intentionally kept for investigation.
+const OVERVIEW_WITHHELD_TOOLS: &[&str] = &["write_file", "edit_file", "replace_symbol"];
 
 /// System prompt for the helper-validation pass.
 const HELPER_VALIDATION_SYSTEM: &str = "\
@@ -531,23 +535,46 @@ impl Orchestrator {
             OVERVIEW_EXISTING_INSTRUCTIONS.to_string()
         };
         eprintln!("--- no overview on file; cratchit is writing one ---");
-        let text = self.cratchit_execute(task, &instructions, None).await?;
-        let text = text.trim();
+        let text = self.cratchit_overview(task, &instructions).await?;
         if text.is_empty() {
             anyhow::bail!("cratchit produced an empty overview");
         }
-        crate::overview::save(&root, text)?;
+        crate::overview::save(&root, &text)?;
         eprintln!(
             "wrote {} (edit freely; it is sent with every briefing)",
             crate::overview::path(&root).display()
         );
-        Ok(text.to_string())
+        Ok(text)
+    }
+
+    /// Run Cratchit on an overview instruction and return its trimmed final
+    /// message. Shared by `ensure_overview` and `refresh_overview`: both
+    /// withhold the file-writing tools (see `overview_tools`) and let the
+    /// orchestrator, not Cratchit, persist the result.
+    async fn cratchit_overview(&mut self, task: &str, instructions: &str) -> Result<String> {
+        let text = self
+            .cratchit_execute_with(task, instructions, None, Self::overview_tools())
+            .await?;
+        Ok(text.trim().to_string())
+    }
+
+    /// Tool set for the overview passes: everything except the file-writing
+    /// tools, so Cratchit returns the overview text instead of editing the
+    /// file. `shell` stays available for investigation.
+    fn overview_tools() -> Vec<Value> {
+        tools::definitions()
+            .into_iter()
+            .filter(|d| {
+                !OVERVIEW_WITHHELD_TOOLS.contains(&d["function"]["name"].as_str().unwrap_or(""))
+            })
+            .collect()
     }
 
     /// After a fulfilled task that wrote code, have Cratchit reconsider the
-    /// overview against the diff; he edits .scrooge/overview.md himself when
-    /// it has gone stale. Best-effort — a failure here must never tarnish a
-    /// task that already completed.
+    /// overview against the diff. Like `ensure_overview`, Cratchit does NOT
+    /// touch the file: he returns the rewritten overview (or "UNCHANGED") and
+    /// the orchestrator saves it. Best-effort — a failure here must never
+    /// tarnish a task that already completed.
     pub async fn refresh_overview(&mut self, task: &str) {
         let root = self.toolbox.root.clone();
         if crate::overview::load(&root).is_none() {
@@ -559,8 +586,16 @@ impl Orchestrator {
         // The current overview is already injected into the briefing by
         // cratchit_execute, so the instructions only need the diff.
         let instructions = OVERVIEW_REFRESH_INSTRUCTIONS.replace("{CHANGED}", &changed);
-        match self.cratchit_execute(task, &instructions, None).await {
-            Ok(report) => eprintln!("--- overview review ---\n{}", report.trim()),
+        match self.cratchit_overview(task, &instructions).await {
+            Ok(text) => {
+                if text.is_empty() || text.eq_ignore_ascii_case("UNCHANGED") {
+                    eprintln!("--- overview review: unchanged ---");
+                } else if let Err(e) = crate::overview::save(&root, &text) {
+                    eprintln!("[overview save failed (task still complete): {e:#}]");
+                } else {
+                    eprintln!("--- overview updated ---\n{text}");
+                }
+            }
             Err(e) => eprintln!("[overview review failed (task still complete): {e:#}]"),
         }
     }
@@ -771,7 +806,21 @@ impl Orchestrator {
         plan: &str,
         prev_report: Option<&str>,
     ) -> Result<String> {
-        let defs = tools::definitions();
+        self.cratchit_execute_with(task, plan, prev_report, tools::definitions())
+            .await
+    }
+
+    /// As `cratchit_execute`, but with an explicit tool set. Used by
+    /// `ensure_overview` to withhold the file-writing tools: the overview is
+    /// captured from Cratchit's final message and saved by the orchestrator,
+    /// so a Cratchit that writes overview.md itself is only a mistake.
+    async fn cratchit_execute_with(
+        &mut self,
+        task: &str,
+        plan: &str,
+        prev_report: Option<&str>,
+        defs: Vec<Value>,
+    ) -> Result<String> {
         // Inject context deterministically instead of having the model fetch
         // it: the code map sliced to what the plan mentions, the full
         // best-practice sections relevant to task + plan, and the previous
