@@ -4,6 +4,7 @@
 
 use anyhow::Result;
 use serde_json::{Value, json};
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
@@ -14,14 +15,14 @@ pub struct Toolbox {
     pub root: PathBuf,
 }
 
-fn tool(name: &str, desc: &str, params: Value) -> Value {
+fn tool(name: &str, desc: &str, params: &Value) -> Value {
     json!({
         "type": "function",
         "function": { "name": name, "description": desc, "parameters": params }
     })
 }
 
-fn obj(props: Value, required: &[&str]) -> Value {
+fn obj(props: &Value, required: &[&str]) -> Value {
     json!({ "type": "object", "properties": props, "required": required })
 }
 
@@ -34,8 +35,8 @@ pub fn definitions() -> Vec<Value> {
         tool(
             "read_file",
             "Read a file. Files over 400 lines return an outline instead; pass start_line/end_line (max 250 lines per call).",
-            obj(
-                json!({
+            &obj(
+                &json!({
                     "path": {"type": "string"},
                     "start_line": {"type": "integer", "description": "1-based, optional"},
                     "end_line": {"type": "integer", "description": "inclusive, optional"}
@@ -46,16 +47,16 @@ pub fn definitions() -> Vec<Value> {
         tool(
             "write_file",
             "Create or overwrite a file. Result includes a syntax verdict.",
-            obj(
-                json!({"path": {"type": "string"}, "content": {"type": "string"}}),
+            &obj(
+                &json!({"path": {"type": "string"}, "content": {"type": "string"}}),
                 &["path", "content"],
             ),
         ),
         tool(
             "edit_file",
             "Apply one or more find/replace edits to a file in order, all-or-nothing. Each find must match exactly once (whitespace-tolerant fallback) unless its replace_all is true. Returns applied line numbers and a syntax verdict — no need to re-read.",
-            obj(
-                json!({
+            &obj(
+                &json!({
                     "path": {"type": "string"},
                     "edits": {
                         "type": "array",
@@ -76,8 +77,8 @@ pub fn definitions() -> Vec<Value> {
         tool(
             "replace_symbol",
             "Replace an entire function/method/struct by its code-map name with new source — no find string needed, the span comes from the parser. Returns a syntax verdict. Optional path narrows when the name is ambiguous.",
-            obj(
-                json!({
+            &obj(
+                &json!({
                     "name": {"type": "string", "description": "symbol name from the code map, e.g. 'parse' or 'Client.chat'"},
                     "new_source": {"type": "string", "description": "full replacement definition"},
                     "path": {"type": "string", "description": "file filter when ambiguous, optional"}
@@ -88,62 +89,62 @@ pub fn definitions() -> Vec<Value> {
         tool(
             "shell",
             "Run a shell command in the project root (tests, builds, grep). 60s timeout.",
-            obj(json!({"command": {"type": "string"}}), &["command"]),
+            &obj(&json!({"command": {"type": "string"}}), &["command"]),
         ),
         tool(
             "python",
             "Run Python code; use for ALL math, counting and data transformation — never compute in your head. Prints stdout.",
-            obj(json!({"code": {"type": "string"}}), &["code"]),
+            &obj(&json!({"code": {"type": "string"}}), &["code"]),
         ),
         tool(
             "wolfram",
             "WolframScript for symbolic math, calculus, equation solving.",
-            obj(json!({"expression": {"type": "string"}}), &["expression"]),
+            &obj(&json!({"expression": {"type": "string"}}), &["expression"]),
         ),
         tool(
             "symbol_info",
             "Signature, location, callers and callees of a symbol.",
-            obj(json!({"name": {"type": "string"}}), &["name"]),
+            &obj(&json!({"name": {"type": "string"}}), &["name"]),
         ),
         tool(
             "callers",
             "Functions that call the named function.",
-            obj(json!({"name": {"type": "string"}}), &["name"]),
+            &obj(&json!({"name": {"type": "string"}}), &["name"]),
         ),
         tool(
             "callees",
             "Functions the named function calls.",
-            obj(json!({"name": {"type": "string"}}), &["name"]),
+            &obj(&json!({"name": {"type": "string"}}), &["name"]),
         ),
         tool(
             "query_docs",
             "Official docs: python=pydoc, rust=docs.rs, js=MDN. Check before using any API you are not 100% sure about.",
-            obj(
-                json!({"lang": {"type": "string", "enum": ["python", "rust", "js"]}, "query": {"type": "string", "description": "module/symbol, e.g. 'os.path.join', 'serde_json', 'Array.prototype.map'"}}),
+            &obj(
+                &json!({"lang": {"type": "string", "enum": ["python", "rust", "js"]}, "query": {"type": "string", "description": "module/symbol, e.g. 'os.path.join', 'serde_json', 'Array.prototype.map'"}}),
                 &["lang", "query"],
             ),
         ),
         tool(
             "helpers",
             "Generic utility functions known in this repo and its dependencies; check before writing a new helper. Optional substring filter.",
-            obj(
-                json!({"filter": {"type": "string", "description": "substring filter, optional"}}),
+            &obj(
+                &json!({"filter": {"type": "string", "description": "substring filter, optional"}}),
                 &[],
             ),
         ),
         tool(
             "search_libraries",
             "Web-search for the best external library for a need; call before add_dependency when choosing a library — do not pick from memory.",
-            obj(
-                json!({"query": {"type": "string", "description": "what you need, e.g. 'rust crate for parsing TOML'"}}),
+            &obj(
+                &json!({"query": {"type": "string", "description": "what you need, e.g. 'rust crate for parsing TOML'"}}),
                 &["query"],
             ),
         ),
         tool(
             "add_dependency",
             "Add a dependency at its latest published version (cargo add / pip install -U / npm install @latest). Never write version numbers from memory.",
-            obj(
-                json!({"lang": {"type": "string", "enum": ["python", "rust", "js"]}, "package": {"type": "string"}, "dev": {"type": "boolean", "description": "dev-dependency, optional"}}),
+            &obj(
+                &json!({"lang": {"type": "string", "enum": ["python", "rust", "js"]}, "package": {"type": "string"}, "dev": {"type": "boolean", "description": "dev-dependency, optional"}}),
                 &["lang", "package"],
             ),
         ),
@@ -156,7 +157,7 @@ const MAX_OUTPUT: usize = 8000;
 /// "read line ranges" rule is enforced in code rather than pleaded in prompts.
 const MAX_WHOLE_FILE_LINES: usize = 400;
 
-/// Largest line range a single read_file call returns.
+/// Largest line range a single `read_file` call returns.
 const MAX_RANGE_LINES: usize = 250;
 
 /// Whitespace-tolerant match: byte ranges of line windows whose trimmed
@@ -237,15 +238,15 @@ pub fn or_none(s: String) -> String {
 
 /// "syntax OK" or a warning naming the first bad line, per tree-sitter.
 fn syntax_verdict(path: &Path, src: &str) -> String {
-    match codemap::syntax_error_line(path, src) {
-        Some(line) => format!("WARNING: syntax error near line {line}"),
-        None => "syntax OK".into(),
-    }
+    codemap::syntax_error_line(path, src).map_or_else(
+        || "syntax OK".into(),
+        |line| format!("WARNING: syntax error near line {line}"),
+    )
 }
 
 impl Toolbox {
-    pub fn new(root: PathBuf) -> Self {
-        Toolbox { root }
+    pub const fn new(root: PathBuf) -> Self {
+        Self { root }
     }
 
     fn resolve(&self, p: &str) -> PathBuf {
@@ -301,40 +302,39 @@ impl Toolbox {
                 let content = std::fs::read_to_string(&path)?;
                 let start = args["start_line"].as_u64().map(|n| n as usize);
                 let end = args["end_line"].as_u64().map(|n| n as usize);
-                Ok(match (start, end) {
-                    (Some(a), b) => {
-                        // Cap range size too, or 1..999999 would bypass the
-                        // whole-file guard below.
-                        let wanted = b.unwrap_or(usize::MAX);
-                        let capped = wanted.min(a.saturating_add(MAX_RANGE_LINES - 1));
-                        let mut out = content
-                            .lines()
-                            .enumerate()
-                            .filter(|(i, _)| *i + 1 >= a && *i < capped)
-                            .map(|(i, l)| format!("{}|{l}", i + 1))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        let total = content.lines().count();
-                        if out.is_empty() {
-                            out = format!(
-                                "no lines in range {a}-{} — file has {total} lines",
-                                if wanted == usize::MAX { total } else { wanted }
-                            );
-                        } else if capped < wanted && capped < total {
-                            out.push_str(&format!(
-                                "\n[range clamped to {MAX_RANGE_LINES} lines; \
-                                 request another range to continue]"
-                            ));
-                        }
-                        out
+                Ok(if let (Some(a), b) = (start, end) {
+                    // Cap range size too, or 1..999999 would bypass the
+                    // whole-file guard below.
+                    let wanted = b.unwrap_or(usize::MAX);
+                    let capped = wanted.min(a.saturating_add(MAX_RANGE_LINES - 1));
+                    let mut out = content
+                        .lines()
+                        .enumerate()
+                        .filter(|(i, _)| *i + 1 >= a && *i < capped)
+                        .map(|(i, l)| format!("{}|{l}", i + 1))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let total = content.lines().count();
+                    if out.is_empty() {
+                        out = format!(
+                            "no lines in range {a}-{} — file has {total} lines",
+                            if wanted == usize::MAX { total } else { wanted }
+                        );
+                    } else if capped < wanted && capped < total {
+                        write!(
+                            out,
+                            "\n[range clamped to {MAX_RANGE_LINES} lines; \
+                             request another range to continue]"
+                        )
+                        .unwrap();
                     }
-                    _ => {
-                        let total = content.lines().count();
-                        if total > MAX_WHOLE_FILE_LINES {
-                            self.file_outline(&path, total)?
-                        } else {
-                            content
-                        }
+                    out
+                } else {
+                    let total = content.lines().count();
+                    if total > MAX_WHOLE_FILE_LINES {
+                        self.file_outline(&path, total)?
+                    } else {
+                        content
                     }
                 })
             }
@@ -398,21 +398,24 @@ impl Toolbox {
         }
         // Array form is canonical; the legacy single find/replace form is
         // still accepted so a confused model isn't hard-stuck.
-        let edits: Vec<E> = match args["edits"].as_array() {
-            Some(arr) => arr
-                .iter()
-                .map(|e| E {
-                    find: e["find"].as_str().unwrap_or("").to_string(),
-                    replace: e["replace"].as_str().unwrap_or("").to_string(),
-                    all: e["replace_all"].as_bool().unwrap_or(false),
-                })
-                .collect(),
-            None => vec![E {
-                find: args["find"].as_str().unwrap_or("").to_string(),
-                replace: args["replace"].as_str().unwrap_or("").to_string(),
-                all: args["replace_all"].as_bool().unwrap_or(false),
-            }],
-        };
+        let edits: Vec<E> = args["edits"].as_array().map_or_else(
+            || {
+                vec![E {
+                    find: args["find"].as_str().unwrap_or("").to_string(),
+                    replace: args["replace"].as_str().unwrap_or("").to_string(),
+                    all: args["replace_all"].as_bool().unwrap_or(false),
+                }]
+            },
+            |arr| {
+                arr.iter()
+                    .map(|e| E {
+                        find: e["find"].as_str().unwrap_or("").to_string(),
+                        replace: e["replace"].as_str().unwrap_or("").to_string(),
+                        all: e["replace_all"].as_bool().unwrap_or(false),
+                    })
+                    .collect()
+            },
+        );
         if edits.is_empty() || edits.iter().any(|e| e.find.is_empty()) {
             anyhow::bail!("no edits given (each needs a non-empty `find`)");
         }
@@ -562,12 +565,11 @@ impl Toolbox {
     fn file_outline(&self, path: &Path, total_lines: usize) -> Result<String> {
         let map = codemap::build_cached(&self.root)?;
         let rel = path.strip_prefix(&self.root).unwrap_or(path);
-        let outline: String = map
-            .symbols
-            .iter()
-            .filter(|s| s.file == rel)
-            .map(|s| format!("  L{}-{} {}\n", s.line, s.end_line, s.signature))
-            .collect();
+        let mut outline = String::new();
+        for s in map.symbols.iter().filter(|s| s.file == rel) {
+            use std::fmt::Write;
+            let _ = writeln!(outline, "  L{}-{} {}", s.line, s.end_line, s.signature);
+        }
         Ok(format!(
             "{} is {total_lines} lines — too large to read whole; request a \
              start_line/end_line range instead. Outline:\n{outline}",
@@ -598,7 +600,8 @@ impl Toolbox {
             s.push_str(err.trim());
         }
         if !out.status.success() {
-            s.push_str(&format!("\n[exit {}]", out.status.code().unwrap_or(-1)));
+            use std::fmt::Write;
+            let _ = write!(s, "\n[exit {}]", out.status.code().unwrap_or(-1));
         }
         Ok(s)
     }

@@ -17,7 +17,7 @@ pub struct Server {
     orch: Option<Orchestrator>,
 }
 
-fn tool(name: &str, desc: &str, props: Value, required: &[&str]) -> Value {
+fn tool(name: &str, desc: &str, props: &Value, required: &[&str]) -> Value {
     json!({
         "name": name,
         "description": desc,
@@ -30,49 +30,49 @@ fn tool_list() -> Value {
         tool(
             "get_brief",
             "Project overview (what the codebase is and how it hangs together) plus a compact codebase map: every file with its functions/classes/line numbers. Pass `about` (task keywords) to slice the map — only matching files in full, the rest as names. Never read source files directly — that's what Cratchit is for.",
-            json!({"about": {"type": "string", "description": "task keywords to slice the brief by, optional"}}),
+            &json!({"about": {"type": "string", "description": "task keywords to slice the brief by, optional"}}),
             &[]
         ),
         tool(
             "run_checks",
             "Run the deterministic check suite (format, tests, lint autofix) and return the verdict. Zero LLM cost — use this to verify instead of dispatching Cratchit.",
-            json!({}),
+            &json!({}),
             &[]
         ),
         tool(
             "symbol_info",
             "Signature, location, callers and callees of a symbol from the call graph.",
-            json!({"name": {"type": "string"}}),
+            &json!({"name": {"type": "string"}}),
             &["name"]
         ),
         tool(
             "callers",
             "Functions that call the named function.",
-            json!({"name": {"type": "string"}}),
+            &json!({"name": {"type": "string"}}),
             &["name"]
         ),
         tool(
             "callees",
             "Functions the named function calls.",
-            json!({"name": {"type": "string"}}),
+            &json!({"name": {"type": "string"}}),
             &["name"]
         ),
         tool(
             "helpers",
             "Known generic utility functions in this repo and its dependencies. Check before writing (or asking Cratchit to write) any new helper.",
-            json!({"filter": {"type": "string", "description": "substring filter, optional"}}),
+            &json!({"filter": {"type": "string", "description": "substring filter, optional"}}),
             &[]
         ),
         tool(
             "best_practices",
             "Project best-practice sections matching the given topic keywords.",
-            json!({"topic": {"type": "string"}}),
+            &json!({"topic": {"type": "string"}}),
             &["topic"]
         ),
         tool(
             "give_cratchit_task",
             "Dispatch a concrete task to Cratchit, a cheap agent with full tool access (files, shell, python, wolfram, docs, call graph). He executes and returns a short report ending with machine-generated CHANGED (git diffstat) and CHECKS (format/test/lint verdict) lines — trust those over his claims; mechanical check failures are already retried automatically. Use this for ALL file reading, editing, and verification instead of doing it yourself.",
-            json!({
+            &json!({
                 "task": {"type": "string", "description": "overall goal, one line"},
                 "instructions": {"type": "string", "description": "numbered concrete steps naming exact files/symbols"}
             }),
@@ -81,15 +81,15 @@ fn tool_list() -> Value {
         tool(
             "ask_cratchit",
             "Have Cratchit investigate a question with his tools and return a compressed answer. Use instead of reading code yourself.",
-            json!({"question": {"type": "string"}}),
+            &json!({"question": {"type": "string"}}),
             &["question"]
         ),
     ])
 }
 
 impl Server {
-    pub fn new(root: PathBuf) -> Self {
-        Server { root, orch: None }
+    pub const fn new(root: PathBuf) -> Self {
+        Self { root, orch: None }
     }
 
     pub async fn run(&mut self) -> Result<()> {

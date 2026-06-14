@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use std::io::Write;
 use std::path::Path;
 
+#[allow(clippy::too_many_arguments)]
 pub fn record(
     root: &Path,
     agent: &str,

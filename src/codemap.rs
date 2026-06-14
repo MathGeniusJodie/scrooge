@@ -4,6 +4,7 @@
 
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
@@ -22,15 +23,15 @@ pub enum SymbolKind {
 }
 
 impl SymbolKind {
-    fn short(&self) -> &'static str {
+    const fn short(&self) -> &'static str {
         match self {
-            SymbolKind::Function => "fn",
-            SymbolKind::Method => "method",
-            SymbolKind::Struct => "struct",
-            SymbolKind::Enum => "enum",
-            SymbolKind::Trait => "trait",
-            SymbolKind::Class => "class",
-            SymbolKind::Impl => "impl",
+            Self::Function => "fn",
+            Self::Method => "method",
+            Self::Struct => "struct",
+            Self::Enum => "enum",
+            Self::Trait => "trait",
+            Self::Class => "class",
+            Self::Impl => "impl",
         }
     }
 }
@@ -97,10 +98,9 @@ fn source_files(root: &Path) -> impl Iterator<Item = walkdir::DirEntry> {
         .filter_entry(|e| {
             !e.file_name()
                 .to_str()
-                .map(|n| SKIP_DIRS.contains(&n))
-                .unwrap_or(false)
+                .is_some_and(|n| SKIP_DIRS.contains(&n))
         })
-        .filter_map(|e| e.ok())
+        .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file() && lang_for(e.path()).is_some())
 }
 
@@ -127,12 +127,11 @@ pub fn build_limited(root: &Path, max_files: usize) -> Result<CodeMap> {
         if seen > max_files {
             break;
         }
-        let src = match std::fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(_) => continue, // non-utf8 etc.
+        let Ok(src) = std::fs::read_to_string(path) else {
+            continue; // non-utf8 etc.
         };
         let rel = path.strip_prefix(root).unwrap_or(path).to_path_buf();
-        index_file(&mut map, &rel, &src, lang)?;
+        index_file(&mut map, &rel, &src, &lang)?;
     }
     resolve_calls(&mut map);
     Ok(map)
@@ -163,17 +162,20 @@ fn cache_key(root: &Path) -> (SystemTime, usize) {
 pub fn build_cached(root: &Path) -> Result<Arc<CodeMap>> {
     let (mtime, count) = cache_key(root);
     let cache = CACHE.get_or_init(|| Mutex::new(None));
-    let mut guard = cache.lock().unwrap();
-    if let Some((r, t, c, map)) = guard.as_ref()
-        && r == root
-        && *t == mtime
-        && *c == count
     {
-        return Ok(map.clone());
+        let mut guard = cache.lock().unwrap();
+        if let Some(v) = guard.as_ref()
+            && v.0 == root
+            && v.1 == mtime
+            && v.2 == count
+        {
+            return Ok(v.3.clone());
+        }
+        let map = Arc::new(build(root)?);
+        *guard = Some((root.to_path_buf(), mtime, count, map.clone()));
+        drop(guard);
+        Ok(map)
     }
-    let map = Arc::new(build(root)?);
-    *guard = Some((root.to_path_buf(), mtime, count, map.clone()));
-    Ok(map)
 }
 
 /// Line of the first syntax error in `src` per the file's grammar, or None
@@ -215,8 +217,8 @@ fn ts_language(lang: &Lang) -> Language {
     }
 }
 
-fn index_file(map: &mut CodeMap, rel: &Path, src: &str, lang: Lang) -> Result<()> {
-    if let Lang::Html = lang {
+fn index_file(map: &mut CodeMap, rel: &Path, src: &str, lang: &Lang) -> Result<()> {
+    if matches!(lang, Lang::Html) {
         // Parse HTML only to pull out <script> bodies, then index those as JS.
         let mut parser = Parser::new();
         parser
@@ -224,21 +226,19 @@ fn index_file(map: &mut CodeMap, rel: &Path, src: &str, lang: Lang) -> Result<()
             .context("html grammar")?;
         if let Some(tree) = parser.parse(src, None) {
             collect_scripts(tree.root_node(), src.as_bytes(), &mut |js| {
-                let _ = index_file(map, rel, js, Lang::Js);
+                let _ = index_file(map, rel, js, &Lang::Js);
             });
         }
         return Ok(());
     }
 
     let mut parser = Parser::new();
-    parser
-        .set_language(&ts_language(&lang))
-        .context("grammar")?;
+    parser.set_language(&ts_language(lang)).context("grammar")?;
     let Some(tree) = parser.parse(src, None) else {
         return Ok(());
     };
     let bytes = src.as_bytes();
-    walk(map, rel, bytes, tree.root_node(), &lang, None);
+    walk(map, rel, bytes, tree.root_node(), lang, None);
     Ok(())
 }
 
@@ -286,7 +286,7 @@ fn walk(
 ) {
     let kind = node.kind();
     let def: Option<(SymbolKind, Option<String>)> = match (lang, kind) {
-        (Lang::Rust, "function_item") => Some((
+        (Lang::Rust, "function_item") | (Lang::Python, "function_definition") => Some((
             if parent.is_some() {
                 SymbolKind::Method
             } else {
@@ -302,29 +302,21 @@ fn walk(
             node.child_by_field_name("type")
                 .map(|n| text(n, bytes).to_string()),
         )),
-        (Lang::Python, "function_definition") => Some((
-            if parent.is_some() {
-                SymbolKind::Method
-            } else {
-                SymbolKind::Function
-            },
-            name_of(node, bytes),
-        )),
-        (Lang::Python, "class_definition") => Some((SymbolKind::Class, name_of(node, bytes))),
-        (Lang::Js, "function_declaration") | (Lang::Js, "generator_function_declaration") => {
+        (Lang::Python, "class_definition") | (Lang::Js, "class_declaration") => {
+            Some((SymbolKind::Class, name_of(node, bytes)))
+        }
+        (Lang::Js, "function_declaration" | "generator_function_declaration") => {
             Some((SymbolKind::Function, name_of(node, bytes)))
         }
         (Lang::Js, "method_definition") => Some((SymbolKind::Method, name_of(node, bytes))),
-        (Lang::Js, "class_declaration") => Some((SymbolKind::Class, name_of(node, bytes))),
         _ => None,
     };
 
     // JS: const foo = () => {} / function expressions assigned to names.
-    let js_assigned_fn = if let (Lang::Js, "variable_declarator") = (lang, kind) {
+    let js_assigned_fn = if matches!((lang, kind), (Lang::Js, "variable_declarator")) {
         let is_fn = node
             .child_by_field_name("value")
-            .map(|v| matches!(v.kind(), "arrow_function" | "function_expression"))
-            .unwrap_or(false);
+            .is_some_and(|v| matches!(v.kind(), "arrow_function" | "function_expression"));
         if is_fn { name_of(node, bytes) } else { None }
     } else {
         None
@@ -380,8 +372,8 @@ fn walk(
 fn collect_calls(map: &mut CodeMap, bytes: &[u8], node: Node, lang: &Lang, caller: &str) {
     let mut stack = vec![node];
     while let Some(n) = stack.pop() {
-        let callee: Option<String> = match (lang, n.kind()) {
-            (Lang::Rust, "call_expression") | (Lang::Js, "call_expression") => n
+        let callee_name_opt: Option<String> = match (lang, n.kind()) {
+            (Lang::Rust | Lang::Js, "call_expression") => n
                 .child_by_field_name("function")
                 .map(|f| callee_name(f, bytes)),
             (Lang::Python, "call") => n
@@ -389,7 +381,7 @@ fn collect_calls(map: &mut CodeMap, bytes: &[u8], node: Node, lang: &Lang, calle
                 .map(|f| callee_name(f, bytes)),
             _ => None,
         };
-        if let Some(name) = callee
+        if let Some(name) = callee_name_opt
             && !name.is_empty()
         {
             map.calls
@@ -533,7 +525,7 @@ impl CodeMap {
             if relevant {
                 out.push_str(&Self::file_line(file, &syms));
             } else {
-                out.push_str(&format!("{}\n", file.display()));
+                writeln!(out, "{}", file.display()).unwrap();
             }
         }
         out
@@ -547,23 +539,27 @@ impl CodeMap {
             .iter()
             .filter(|s| s.name == name || s.name.ends_with(&format!(".{name}")))
         {
-            out.push_str(&format!(
+            write!(
+                out,
                 "{} {} @ {}:{}\n  {}\n",
                 s.kind.short(),
                 s.name,
                 s.file.display(),
                 s.line,
                 s.signature
-            ));
+            )
+            .unwrap();
             if let Some(callees) = self.calls.get(&s.name) {
-                out.push_str(&format!(
-                    "  calls: {}\n",
+                writeln!(
+                    out,
+                    "  calls: {}",
                     callees.iter().cloned().collect::<Vec<_>>().join(", ")
-                ));
+                )
+                .unwrap();
             }
             let callers = self.callers_of(&s.name);
             if !callers.is_empty() {
-                out.push_str(&format!("  called-by: {}\n", callers.join(", ")));
+                writeln!(out, "  called-by: {}", callers.join(", ")).unwrap();
             }
         }
         if out.is_empty() {

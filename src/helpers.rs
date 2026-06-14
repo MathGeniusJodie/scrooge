@@ -1,19 +1,20 @@
 //! Generic-utility extraction. Finds helper functions in the repo and in all
 //! its dependencies (cargo registry sources, python site-packages,
-//! node_modules) using heuristics — cross-file fan-in, utility-shaped names,
+//! `node_modules`) using heuristics — cross-file fan-in, utility-shaped names,
 //! small bodies, public visibility — so agents can reuse instead of reinvent.
 //! Candidates can be validated/annotated by Cratchit and are cached on disk.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
 use crate::codemap::{self, CodeMap, SymbolKind};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Helper {
-    /// "repo" or the dependency name (e.g. "serde_json", "lodash").
+    /// `"repo"` or the dependency name (e.g. `"serde_json"`, `"lodash"`).
     pub origin: String,
     pub name: String,
     pub signature: String,
@@ -78,7 +79,7 @@ const MAX_HELPERS_PER_DEP: usize = 25;
 fn name_score(name: &str) -> u32 {
     let lower = name.to_lowercase();
     let bare = lower.rsplit('.').next().unwrap_or(&lower);
-    UTIL_NAMES.iter().any(|p| bare.contains(p)) as u32 * 2
+    u32::from(UTIL_NAMES.iter().any(|p| bare.contains(p))) * 2
 }
 
 /// Score every function in a map; `public_only` is used for dependencies,
@@ -105,22 +106,22 @@ fn score_map(origin: &str, map: &CodeMap, base: &Path, public_only: bool) -> Vec
         if !matches!(s.kind, SymbolKind::Function) {
             continue; // methods need an instance — not drop-in reusable
         }
-        let bare = s.name.rsplit('.').next().unwrap_or(&s.name);
-        if bare.starts_with('_') || bare == "main" || bare.starts_with("test") {
+        let bare_name = s.name.rsplit('.').next().unwrap_or(&s.name);
+        if bare_name.starts_with('_') || bare_name == "main" || bare_name.starts_with("test") {
             continue;
         }
         if s.end_line.saturating_sub(s.line) > MAX_HELPER_LINES {
             continue; // helpers are small
         }
         // Visibility: rust needs `pub`; python/js use the underscore check above.
-        let is_rust = s.file.extension().map(|e| e == "rs").unwrap_or(false);
+        let is_rust = s.file.extension().is_some_and(|e| e == "rs");
         if public_only && is_rust && !s.signature.starts_with("pub ") {
             continue;
         }
-        let files = fan_in.get(s.name.as_str()).map(|f| f.len()).unwrap_or(0);
+        let files = fan_in.get(s.name.as_str()).map_or(0, BTreeSet::len);
         // Single-file usage is not evidence of genericity — only cross-file is.
         let cross = if files >= 2 {
-            (files.min(5) as u32) * 2
+            u32::try_from(files.min(5)).unwrap_or(u32::MAX) * 2
         } else {
             0
         };
@@ -149,7 +150,7 @@ pub fn repo_helpers(root: &Path) -> Result<Vec<Helper>> {
     Ok(score_map("repo", &map, Path::new(""), false))
 }
 
-pub fn dep_helpers(root: &Path) -> Result<Vec<Helper>> {
+pub fn dep_helpers(root: &Path) -> Vec<Helper> {
     let mut deps: Vec<(String, PathBuf)> = Vec::new();
     deps.extend(rust_deps(root).unwrap_or_default());
     deps.extend(python_deps(root));
@@ -164,7 +165,7 @@ pub fn dep_helpers(root: &Path) -> Result<Vec<Helper>> {
         helpers.truncate(MAX_HELPERS_PER_DEP);
         out.extend(helpers);
     }
-    Ok(out)
+    out
 }
 
 /// Cargo dependencies via `cargo metadata`: every non-workspace package's
@@ -195,7 +196,7 @@ fn rust_deps(root: &Path) -> Result<Vec<(String, PathBuf)>> {
         };
         let src = Path::new(manifest)
             .parent()
-            .unwrap_or(Path::new("/"))
+            .unwrap_or_else(|| Path::new("/"))
             .join("src");
         if src.is_dir() {
             deps.push((name.to_string(), src));
@@ -264,7 +265,7 @@ fn python_deps(root: &Path) -> Vec<(String, PathBuf)> {
     deps
 }
 
-/// JS dependencies: top-level packages in node_modules (including @scopes).
+/// JS dependencies: top-level packages in `node_modules` (including @scopes).
 fn js_deps(root: &Path) -> Vec<(String, PathBuf)> {
     let nm = root.join("node_modules");
     let mut deps = Vec::new();
@@ -357,12 +358,14 @@ pub fn filtered_listing(root: &Path, filter: &str) -> Result<String> {
 pub fn render(helpers: &[Helper]) -> String {
     let mut out = String::new();
     for h in helpers {
-        out.push_str(&format!(
+        write!(
+            out,
             "[{}] {} — {} ({}:{}, used in {} files)",
             h.origin, h.name, h.signature, h.file, h.line, h.fan_in
-        ));
+        )
+        .unwrap();
         if let Some(p) = &h.purpose {
-            out.push_str(&format!(" :: {p}"));
+            write!(out, " :: {p}").unwrap();
         }
         out.push('\n');
     }

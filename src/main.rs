@@ -60,7 +60,7 @@ enum Cmd {
     /// with --deps), so agents reuse instead of reinventing. Results are
     /// cached in .scrooge/helpers.json and served by the `helpers` tool.
     Helpers {
-        /// Also scan all dependencies (cargo registry, site-packages, node_modules).
+        /// Also scan all dependencies (cargo registry, site-packages, `node_modules`).
         #[arg(long)]
         deps: bool,
         /// Have Cratchit (cheap LLM) filter heuristic candidates and annotate purposes.
@@ -77,10 +77,10 @@ async fn main() -> Result<()> {
         Cmd::Map => print!("{}", codemap::build(&root)?.brief()),
         Cmd::Sym { name } => print!("{}", codemap::build(&root)?.detail(&name)),
         Cmd::Callers { name } => {
-            println!("{}", codemap::build(&root)?.callers_of(&name).join("\n"))
+            println!("{}", codemap::build(&root)?.callers_of(&name).join("\n"));
         }
         Cmd::Callees { name } => {
-            println!("{}", codemap::build(&root)?.callees_of(&name).join("\n"))
+            println!("{}", codemap::build(&root)?.callees_of(&name).join("\n"));
         }
         Cmd::Run { task } => {
             let mut orch = agents::Orchestrator::new(root)?;
@@ -112,7 +112,7 @@ async fn main() -> Result<()> {
                 eprintln!(
                     "scanning dependencies (cargo registry / site-packages / node_modules)..."
                 );
-                list.extend(helpers::dep_helpers(&root)?);
+                list.extend(helpers::dep_helpers(&root));
             }
             eprintln!("{} heuristic candidates", list.len());
             if validate {

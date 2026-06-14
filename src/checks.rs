@@ -7,6 +7,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -39,19 +40,55 @@ pub fn config_path(root: &Path) -> PathBuf {
     root.join(".scrooge").join("checks.toml")
 }
 
+// Ruff rule sets: E/W (pycodestyle), I (isort), N (naming), UP (pyupgrade),
+// B (bugbear), SIM (simplify), C4 (comprehensions), PERF (performance),
+// RUF (ruff-native), PL (pylint), TID (tidy-imports), PTH (use pathlib).
+// ANN/D (annotations/docstrings) omitted — too noisy for most projects.
+const RUFF_RULES: &str = "E,W,I,N,UP,B,SIM,C4,PERF,RUF,PL,TID,PTH";
+
+// Clippy lint groups beyond the default: pedantic catches common correctness
+// and style issues; nursery holds promising lints still under development.
+// A handful of pedantic lints are suppressed because they produce false
+// positives or are incompatible with typical project structures.
+const CLIPPY_LINTS: &str = "-D warnings \
+    -W clippy::pedantic \
+    -W clippy::nursery \
+    -A clippy::module_name_repetitions \
+    -A clippy::must_use_candidate \
+    -A clippy::missing_errors_doc \
+    -A clippy::missing_panics_doc \
+    -A clippy::too_many_arguments \
+    -A clippy::unused_async \
+    -A clippy::too_many_lines \
+    -A clippy::items_after_statements \
+    -A clippy::cast_possible_truncation";
+
 /// Built-in defaults for whatever languages the repo actually contains.
 fn defaults(root: &Path) -> BTreeMap<String, LangChecks> {
     let mut map = BTreeMap::new();
     if root.join("Cargo.toml").exists() {
+        // rust-code-analysis-cli reports cognitive/cyclomatic complexity per
+        // function. We run it after clippy and surface functions that exceed
+        // a cognitive complexity threshold of 20, but let clippy control
+        // whether the lint step as a whole passes or fails.
+        let rca = "rust-code-analysis-cli -m -p src/ 2>/dev/null \
+            | awk '/cognitive/{gsub(/[^0-9.]/,\" \",$0); for(i=1;i<=NF;i++) \
+              if($i+0>20){print \"High cognitive complexity (\"$i\"): \"FILENAME; break}}'";
         map.insert(
             "rust".into(),
             LangChecks {
                 format: Some("cargo fmt".into()),
                 test: Some("cargo test --quiet".into()),
-                lint_fix: Some(
-                    "cargo clippy --fix --allow-dirty --allow-staged --quiet 2>/dev/null".into(),
-                ),
-                lint: Some("cargo clippy --quiet -- -D warnings".into()),
+                // Autofix with the *same* lint set as the reporting step, so
+                // every machine-applicable pedantic/nursery suggestion is
+                // applied here rather than handed to Cratchit.
+                lint_fix: Some(format!(
+                    "cargo clippy --fix --allow-dirty --allow-staged --quiet -- {CLIPPY_LINTS} \
+                     2>/dev/null"
+                )),
+                lint: Some(format!(
+                    "cargo clippy --quiet -- {CLIPPY_LINTS}; EC=$?; {rca}; exit $EC"
+                )),
             },
         );
     }
@@ -64,19 +101,21 @@ fn defaults(root: &Path) -> BTreeMap<String, LangChecks> {
             LangChecks {
                 format: Some("ruff format .".into()),
                 test: Some("pytest -q".into()),
-                lint_fix: Some("ruff check --fix --quiet .".into()),
-                lint: Some("ruff check .".into()),
+                lint_fix: Some(format!("ruff check --fix --quiet --select {RUFF_RULES} .")),
+                lint: Some(format!("ruff check --select {RUFF_RULES} .")),
             },
         );
     }
     if root.join("package.json").exists() {
+        // Biome replaces both Prettier (formatting) and ESLint (linting).
+        // `biome check` runs linting + import sorting; `--write` autofixes.
         map.insert(
             "javascript".into(),
             LangChecks {
-                format: Some("npx --no-install prettier --log-level warn --write .".into()),
+                format: Some("npx --no-install biome format --write .".into()),
                 test: Some("npm test --silent".into()),
-                lint_fix: Some("npx --no-install eslint --fix --quiet . || true".into()),
-                lint: Some("npx --no-install eslint .".into()),
+                lint_fix: Some("npx --no-install biome check --write . 2>/dev/null || true".into()),
+                lint: Some("npx --no-install biome check .".into()),
             },
         );
     }
@@ -174,12 +213,10 @@ pub fn run(root: &Path) -> Result<Report> {
 pub fn render(report: &Report) -> String {
     let mut s = String::new();
     for (lang, out) in &report.errors {
-        s.push_str(&format!("== {lang}: tests/build FAILED ==\n{out}\n"));
+        write!(s, "== {lang}: tests/build FAILED ==\n{out}\n").unwrap();
     }
     for (lang, out) in &report.warnings {
-        s.push_str(&format!(
-            "== {lang}: warnings remain after autofix ==\n{out}\n"
-        ));
+        write!(s, "== {lang}: warnings remain after autofix ==\n{out}\n").unwrap();
     }
     if s.is_empty() {
         s.push_str("all checks clean\n");

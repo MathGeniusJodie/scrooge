@@ -1,4 +1,4 @@
-//! Minimal OpenRouter chat client with OpenAI-style tool calling.
+//! Minimal `OpenRouter` chat client with OpenAI-style tool calling.
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -23,7 +23,7 @@ pub struct Message {
 
 impl Message {
     pub fn text(role: &str, content: impl Into<String>) -> Self {
-        Message {
+        Self {
             role: role.into(),
             content: Some(content.into()),
             tool_calls: None,
@@ -31,7 +31,7 @@ impl Message {
         }
     }
     pub fn tool_result(id: &str, content: impl Into<String>) -> Self {
-        Message {
+        Self {
             role: "tool".into(),
             content: Some(content.into()),
             tool_calls: None,
@@ -58,7 +58,7 @@ pub struct FunctionCall {
 pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
-    /// Cumulative cost in USD, as reported by OpenRouter (`usage.cost`).
+    /// Cumulative cost in USD, as reported by `OpenRouter` (`usage.cost`).
     pub cost_usd: f64,
 }
 
@@ -67,7 +67,7 @@ pub struct Client {
     api_key: String,
     root: PathBuf,
     pub usage: Usage,
-    /// finish_reason of the most recent completion ("stop", "length", ...),
+    /// `finish_reason` of the most recent completion ("stop", "length", ...),
     /// so callers can detect a truncated response deterministically.
     pub last_finish_reason: Option<String>,
 }
@@ -76,7 +76,7 @@ impl Client {
     pub fn new(root: PathBuf) -> Result<Self> {
         let api_key =
             std::env::var("OPENROUTER_API_KEY").context("OPENROUTER_API_KEY is not set")?;
-        Ok(Client {
+        Ok(Self {
             http: reqwest::Client::new(),
             api_key,
             root,

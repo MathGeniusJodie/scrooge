@@ -12,6 +12,7 @@
 
 use anyhow::Result;
 use serde_json::Value;
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
 use crate::checks;
@@ -58,6 +59,103 @@ check suite also runs after you finish.\n\
 needs (what changed, file:line, verification result, blockers). No pleasantries, \
 no restating the plan, no code unless a decision depends on it.";
 
+// ── LLM prompt templates ────────────────────────────────────────────────────
+// Every string sent to a model lives here as a constant. Templated prompts use
+// {UPPERCASE} placeholders filled in with `str::replace` at the call site, so
+// the wording stays in one place and the methods only assemble values.
+
+/// Per-round briefing for Scrooge. Placeholders: {TASK} {OVERVIEW} {BRIEF}
+/// {GUIDANCE}.
+const SCROOGE_BRIEF: &str = "\
+TASK: {TASK}\n\nPROJECT OVERVIEW:\n{OVERVIEW}\n\n\
+CODEBASE BRIEF:\n{BRIEF}\nKEY GUIDANCE:\n{GUIDANCE}";
+
+/// Briefing for a fresh Cratchit. Placeholders: {ROOT} {TASK} {OVERVIEW}
+/// {PLAN} {PREV} {MAP} {GUIDANCE}.
+const CRATCHIT_BRIEF: &str = "\
+PROJECT ROOT: {ROOT}\nTASK: {TASK}\n{OVERVIEW}\n\
+SCROOGE'S INSTRUCTIONS:\n{PLAN}\n{PREV}\n\
+CODE MAP (files mentioned in the instructions shown in full):\n{MAP}\n\
+GUIDANCE:\n{GUIDANCE}";
+
+/// Wrapper handed to a per-step Cratchit so it sees the whole plan but only
+/// executes its own step. Placeholders: {PLAN} {N} {STEP}.
+const STEP_INSTRUCTIONS: &str = "\
+FULL PLAN (context only — do NOT execute other steps):\n{PLAN}\n\n\
+Execute ONLY step {N}:\n{STEP}";
+
+/// Corrective step synthesized (no Scrooge round) when DONE is proposed while
+/// checks are red. Placeholder: {FAILURES}.
+const CHECK_FAILING_PLAN: &str = "\
+1. The deterministic check suite is failing. Fix the failures below, then \
+verify.\n{FAILURES}";
+
+/// Sent back to Cratchit inside the verify loop when checks fail.
+/// Placeholder: {FAILURES}.
+const CHECK_FAILURE_INSTRUCTIONS: &str = "\
+The deterministic check suite failed after your last changes. Fix the \
+failures below, then verify.\n{FAILURES}";
+
+/// Instruction to write the overview for a brand-new project (no code yet).
+/// Placeholder: {TASK}.
+const OVERVIEW_FRESH_INSTRUCTIONS: &str = "\
+This is a brand-new project being kicked off with this request:\n\
+{TASK}\n\n\
+Write the project overview that future planning will rely on. \
+First line: what the project is, in one sentence. Then one short \
+prose paragraph describing the intended architecture. Do not \
+modify any files. Your final message must be ONLY the overview \
+text, at most 15 lines — it is saved verbatim as overview.md.";
+
+/// Instruction to write the overview for an existing, undocumented codebase.
+const OVERVIEW_EXISTING_INSTRUCTIONS: &str = "\
+This codebase was built without an overview on file. Investigate it \
+(README, manifests, entry points, key modules — read as much as you \
+need) and write the project overview. First line: what the project \
+is, in one sentence. Then one short prose paragraph describing the \
+architecture and the design decisions/invariants that are NOT \
+obvious from a symbol listing (data flow, why the pieces are split \
+this way, what must stay true). Do not modify any files. Your final \
+message must be ONLY the overview text, at most 15 lines — it is \
+saved verbatim as overview.md.";
+
+/// Instruction to reconsider the overview after a completed task.
+/// Placeholder: {CHANGED}.
+const OVERVIEW_REFRESH_INSTRUCTIONS: &str = "\
+The task above is complete. Review the PROJECT OVERVIEW in your \
+briefing against what changed:\n{CHANGED}\n\n\
+If the overview's description of purpose or architecture is now \
+stale, rewrite .scrooge/overview.md (write_file or edit_file): \
+first line — what the project is in one sentence, then one short \
+prose paragraph on architecture and non-obvious invariants, at \
+most 15 lines. If it is still accurate, change NOTHING. Report \
+one line: 'overview updated: <what changed>' or 'overview \
+unchanged'.";
+
+/// Framing for the one-shot `ask` entry point.
+const ASK_INSTRUCTIONS: &str = "Answer the question directly; investigate with tools first.";
+
+/// System prompt for the helper-validation pass.
+const HELPER_VALIDATION_SYSTEM: &str = "\
+You are Cratchit, validating utility-function candidates found by \
+static heuristics. Keep only genuinely GENERIC, reusable helpers — \
+things any module might want (string/path/collection/number/format \
+utilities). Reject anything domain-specific, stateful, or trivial \
+wrappers. If a signature is ambiguous, read the function body with \
+read_file (use the given file path and line range) before deciding. \
+Output one line per keeper, exactly: KEEP <name> | <purpose, max 8 words> \
+Nothing else. No explanations.";
+
+/// Forced-verdict nudge when the helper-validation tool budget runs out.
+const HELPER_VALIDATION_STOP: &str = "\
+STOP: tool budget exhausted. Output your KEEP lines now, \
+nothing else. No tool calls.";
+
+/// Forced final-report nudge when Cratchit's main tool budget runs out.
+const CRATCHIT_STOP: &str = "\
+STOP: tool budget exhausted. Send your final report for Scrooge now \
+— at most 6 lines: state reached, what remains, blockers. No tool calls.";
+
 /// Completion cap for Scrooge: plans are numbered one-liners, so anything
 /// past this is waste on the expensive model.
 const SCROOGE_MAX_TOKENS: u32 = 700;
@@ -81,7 +179,7 @@ const SLICE_BRIEF_OVER: usize = 4000;
 
 /// Largest char boundary <= `i`, so byte-budget truncation never panics on
 /// multibyte UTF-8 (reports and check output routinely contain `—`, `’`, …).
-fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+const fn floor_char_boundary(s: &str, mut i: usize) -> usize {
     while !s.is_char_boundary(i) {
         i -= 1;
     }
@@ -111,7 +209,7 @@ fn plan_steps(plan: &str) -> Vec<String> {
     let mut steps: Vec<String> = Vec::new();
     for line in plan.lines() {
         let t = line.trim_start();
-        let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
+        let digits = t.chars().take_while(char::is_ascii_digit).count();
         let is_new = digits > 0
             && t[digits..]
                 .chars()
@@ -158,7 +256,7 @@ fn digest_steps(reports: &[String]) -> String {
 const EVICT_AFTER_TURNS: usize = 8;
 const EVICT_MIN_CHARS: usize = 400;
 
-/// Replace large tool results older than EVICT_AFTER_TURNS assistant turns
+/// Replace large tool results older than `EVICT_AFTER_TURNS` assistant turns
 /// with a stub. The model can always re-run a tool it still needs.
 fn evict_old_tool_results(log: &mut [Message]) {
     let assistants: Vec<usize> = log
@@ -184,7 +282,7 @@ fn evict_old_tool_results(log: &mut [Message]) {
     }
 }
 
-/// Short stderr preview of tool-call arguments — a full write_file body
+/// Short stderr preview of tool-call arguments — a full `write_file` body
 /// would make the log unreadable.
 fn arg_preview(args: &str) -> String {
     const MAX: usize = 200;
@@ -243,11 +341,11 @@ pub struct Orchestrator {
 
 impl Orchestrator {
     pub fn new(root: PathBuf) -> Result<Self> {
-        Ok(Orchestrator {
+        Ok(Self {
             client: Client::new(root.clone())?,
             toolbox: Toolbox::new(root),
-            cheap_model: std::env::var("CRATCHIT_MODEL").unwrap_or(DEV_MODEL_CHEAP.into()),
-            sota_model: std::env::var("SCROOGE_MODEL").unwrap_or(DEV_MODEL_SOTA.into()),
+            cheap_model: std::env::var("CRATCHIT_MODEL").unwrap_or_else(|_| DEV_MODEL_CHEAP.into()),
+            sota_model: std::env::var("SCROOGE_MODEL").unwrap_or_else(|_| DEV_MODEL_SOTA.into()),
             max_rounds: 5,
         })
     }
@@ -287,10 +385,11 @@ impl Orchestrator {
                 Message::text("system", SCROOGE_SYSTEM),
                 Message::text(
                     "user",
-                    format!(
-                        "TASK: {task}\n\nPROJECT OVERVIEW:\n{overview}\n\n\
-                         CODEBASE BRIEF:\n{brief}\nKEY GUIDANCE:\n{guidance}"
-                    ),
+                    SCROOGE_BRIEF
+                        .replace("{TASK}", task)
+                        .replace("{OVERVIEW}", &overview)
+                        .replace("{BRIEF}", &brief)
+                        .replace("{GUIDANCE}", &guidance),
                 ),
             ];
             if !digests.is_empty() {
@@ -343,10 +442,7 @@ impl Orchestrator {
                     .as_deref()
                     .and_then(|r| r.split("CHECKS: FAILING").nth(1))
                     .unwrap_or("");
-                plan = format!(
-                    "1. The deterministic check suite is failing. Fix the \
-                     failures below, then verify.\n{failures}"
-                );
+                plan = CHECK_FAILING_PLAN.replace("{FAILURES}", failures);
             }
 
             // One fresh Cratchit per plan step, in order. Each step is
@@ -363,10 +459,10 @@ impl Orchestrator {
                     ctx.push_str(&step_reports.join("\n"));
                 }
                 let instructions = if steps.len() > 1 {
-                    format!(
-                        "FULL PLAN (context only — do NOT execute other steps):\n{plan}\n\n\
-                         Execute ONLY step {n}:\n{step}"
-                    )
+                    STEP_INSTRUCTIONS
+                        .replace("{PLAN}", &plan)
+                        .replace("{N}", &n.to_string())
+                        .replace("{STEP}", step)
                 } else {
                     plan.clone()
                 };
@@ -430,26 +526,9 @@ impl Orchestrator {
         }
         let fresh_project = codemap::build_cached(&root)?.symbols.is_empty();
         let instructions = if fresh_project {
-            format!(
-                "This is a brand-new project being kicked off with this request:\n\
-                 {task}\n\n\
-                 Write the project overview that future planning will rely on. \
-                 First line: what the project is, in one sentence. Then one short \
-                 prose paragraph describing the intended architecture. Do not \
-                 modify any files. Your final message must be ONLY the overview \
-                 text, at most 15 lines — it is saved verbatim as overview.md."
-            )
+            OVERVIEW_FRESH_INSTRUCTIONS.replace("{TASK}", task)
         } else {
-            "This codebase was built without an overview on file. Investigate it \
-             (README, manifests, entry points, key modules — read as much as you \
-             need) and write the project overview. First line: what the project \
-             is, in one sentence. Then one short prose paragraph describing the \
-             architecture and the design decisions/invariants that are NOT \
-             obvious from a symbol listing (data flow, why the pieces are split \
-             this way, what must stay true). Do not modify any files. Your final \
-             message must be ONLY the overview text, at most 15 lines — it is \
-             saved verbatim as overview.md."
-                .to_string()
+            OVERVIEW_EXISTING_INSTRUCTIONS.to_string()
         };
         eprintln!("--- no overview on file; cratchit is writing one ---");
         let text = self.cratchit_execute(task, &instructions, None).await?;
@@ -479,17 +558,7 @@ impl Orchestrator {
             .unwrap_or_else(|| "(no diff available)".into());
         // The current overview is already injected into the briefing by
         // cratchit_execute, so the instructions only need the diff.
-        let instructions = format!(
-            "The task above is complete. Review the PROJECT OVERVIEW in your \
-             briefing against what changed:\n{changed}\n\n\
-             If the overview's description of purpose or architecture is now \
-             stale, rewrite .scrooge/overview.md (write_file or edit_file): \
-             first line — what the project is in one sentence, then one short \
-             prose paragraph on architecture and non-obvious invariants, at \
-             most 15 lines. If it is still accurate, change NOTHING. Report \
-             one line: 'overview updated: <what changed>' or 'overview \
-             unchanged'."
-        );
+        let instructions = OVERVIEW_REFRESH_INSTRUCTIONS.replace("{CHANGED}", &changed);
         match self.cratchit_execute(task, &instructions, None).await {
             Ok(report) => eprintln!("--- overview review ---\n{}", report.trim()),
             Err(e) => eprintln!("[overview review failed (task still complete): {e:#}]"),
@@ -553,10 +622,7 @@ impl Orchestrator {
                 &self
                     .cratchit_execute(
                         task,
-                        &format!(
-                            "The deterministic check suite failed after your last \
-                             changes. Fix the failures below, then verify.\n{rendered}"
-                        ),
+                        &CHECK_FAILURE_INSTRUCTIONS.replace("{FAILURES}", &rendered),
                         Some(&prev),
                     )
                     .await?,
@@ -570,15 +636,17 @@ impl Orchestrator {
             } else {
                 a
             };
-            report.push_str(&format!("\nCHANGED:\n{shown}"));
+            write!(report, "\nCHANGED:\n{shown}").unwrap();
         }
         if clean {
             report.push_str("\nCHECKS: clean");
         } else {
-            report.push_str(&format!(
+            write!(
+                report,
                 "\nCHECKS: FAILING\n{}",
                 tail(&failures, MAX_FAIL_CHARS)
-            ));
+            )
+            .unwrap();
         }
         Ok((report, Some(clean)))
     }
@@ -614,18 +682,14 @@ impl Orchestrator {
 
     /// One-shot question for the cheap model with full tool access.
     pub async fn ask(&mut self, question: &str) -> Result<String> {
-        self.cratchit_execute(
-            question,
-            "Answer the question directly; investigate with tools first.",
-            None,
-        )
-        .await
+        self.cratchit_execute(question, ASK_INSTRUCTIONS, None)
+            .await
     }
 
     /// Cratchit reviews heuristic helper candidates and keeps only genuinely
     /// generic, reusable utilities, annotating each with a purpose line.
     /// He may read the source to check a body when the signature is unclear —
-    /// read_file is the only tool he gets for this.
+    /// `read_file` is the only tool he gets for this.
     pub async fn validate_helpers(&mut self, candidates: Vec<Helper>) -> Result<Vec<Helper>> {
         const BATCH: usize = 50;
         let defs: Vec<Value> = tools::definitions()
@@ -636,35 +700,20 @@ impl Orchestrator {
         for batch in candidates.chunks(BATCH) {
             let listing = crate::helpers::render(batch);
             let mut log = vec![
-                Message::text(
-                    "system",
-                    "You are Cratchit, validating utility-function candidates found by \
-                     static heuristics. Keep only genuinely GENERIC, reusable helpers — \
-                     things any module might want (string/path/collection/number/format \
-                     utilities). Reject anything domain-specific, stateful, or trivial \
-                     wrappers. If a signature is ambiguous, read the function body with \
-                     read_file (use the given file path and line range) before deciding. \
-                     Output one line per keeper, exactly: KEEP <name> | <purpose, max 8 words> \
-                     Nothing else. No explanations.",
-                ),
+                Message::text("system", HELPER_VALIDATION_SYSTEM),
                 Message::text("user", format!("CANDIDATES:\n{listing}")),
             ];
-            let text = match self.tool_loop(&mut log, &defs, 20).await? {
-                Some(text) => text,
-                None => {
-                    // Tool budget exhausted mid-batch: force a verdict rather
-                    // than silently dropping every candidate in the batch.
-                    log.push(Message::text(
-                        "user",
-                        "STOP: tool budget exhausted. Output your KEEP lines now, \
-                         nothing else. No tool calls.",
-                    ));
-                    self.client
-                        .chat("cratchit", &self.cheap_model, &log, &[], None)
-                        .await?
-                        .content
-                        .unwrap_or_default()
-                }
+            let text = if let Some(text) = self.tool_loop(&mut log, &defs, 20).await? {
+                text
+            } else {
+                // Tool budget exhausted mid-batch: force a verdict rather
+                // than silently dropping every candidate in the batch.
+                log.push(Message::text("user", HELPER_VALIDATION_STOP));
+                self.client
+                    .chat("cratchit", &self.cheap_model, &log, &[], None)
+                    .await?
+                    .content
+                    .unwrap_or_default()
             };
             for line in text.lines() {
                 let Some(rest) = line.trim().strip_prefix("KEEP ") else {
@@ -742,13 +791,14 @@ impl Orchestrator {
             Message::text("system", CRATCHIT_SYSTEM),
             Message::text(
                 "user",
-                format!(
-                    "PROJECT ROOT: {}\nTASK: {task}\n{overview}\n\
-                     SCROOGE'S INSTRUCTIONS:\n{plan}\n{prev}\n\
-                     CODE MAP (files mentioned in the instructions shown in full):\n{map}\n\
-                     GUIDANCE:\n{guidance}",
-                    self.toolbox.root.display()
-                ),
+                CRATCHIT_BRIEF
+                    .replace("{ROOT}", &self.toolbox.root.display().to_string())
+                    .replace("{TASK}", task)
+                    .replace("{OVERVIEW}", &overview)
+                    .replace("{PLAN}", plan)
+                    .replace("{PREV}", &prev)
+                    .replace("{MAP}", &map)
+                    .replace("{GUIDANCE}", &guidance),
             ),
         ];
         // Tool loop, capped to keep the cheap model from wandering.
@@ -757,11 +807,7 @@ impl Orchestrator {
         }
         // Tool budget exhausted: force a final report deterministically so
         // Scrooge never pays a round to read "hit the limit".
-        log.push(Message::text(
-            "user",
-            "STOP: tool budget exhausted. Send your final report for Scrooge now \
-             — at most 6 lines: state reached, what remains, blockers. No tool calls.",
-        ));
+        log.push(Message::text("user", CRATCHIT_STOP));
         let msg = self
             .client
             .chat("cratchit", &self.cheap_model, &log, &[], None)

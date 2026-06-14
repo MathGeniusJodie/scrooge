@@ -1,6 +1,8 @@
 //! Best-practices document, served piecemeal: only sections whose keywords
 //! match the topic are returned, so the agent never pays for irrelevant rules.
 
+use std::fmt::Write;
+
 const DOC: &str = include_str!("../best_practices.md");
 
 /// A section header is `## title [kw1, kw2, ...]`; it matches if any keyword
@@ -47,7 +49,7 @@ pub fn summary(topic: &str) -> String {
         let title = header.split('[').next().unwrap_or("").trim();
         if let Some(rule) = section.lines().find(|l| l.trim_start().starts_with("- ")) {
             let rule = rule.trim_start().trim_start_matches("- ");
-            out.push_str(&format!("{title}: {rule}\n"));
+            writeln!(out, "{title}: {rule}").unwrap();
         }
     }
     out
