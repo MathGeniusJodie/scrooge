@@ -5,10 +5,50 @@
 //! in .scrooge/ledger.json. Best-effort by design — bookkeeping must never
 //! fail a chat call.
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fmt::Write as _;
 use std::io::Write;
 use std::path::Path;
+
+/// Scrooge-model token prices, in USD per million tokens, used to value the
+/// `shillings_saved` each Cratchit call earns. Lives in .scrooge/rates.toml
+/// so the user (or the agents) can edit it, just like checks.toml.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Rates {
+    /// USD per million prompt (input) tokens on the Scrooge model.
+    pub scrooge_usd_per_mtok_in: f64,
+    /// USD per million completion (output) tokens on the Scrooge model.
+    pub scrooge_usd_per_mtok_out: f64,
+}
+
+impl Default for Rates {
+    fn default() -> Self {
+        Self {
+            scrooge_usd_per_mtok_in: 3.0,
+            scrooge_usd_per_mtok_out: 15.0,
+        }
+    }
+}
+
+/// Load .scrooge/rates.toml, writing it from the defaults first if it doesn't
+/// exist yet (so there is always a file to edit). Best-effort: a malformed or
+/// unreadable file falls back to the built-in defaults rather than failing.
+fn load_rates(dir: &Path) -> Rates {
+    let path = dir.join("rates.toml");
+    if let Ok(text) = std::fs::read_to_string(&path)
+        && let Ok(rates) = toml::from_str(&text)
+    {
+        return rates;
+    }
+    let rates = Rates::default();
+    if let Ok(body) = toml::to_string_pretty(&rates) {
+        let header = "# Scrooge-model token prices (USD per million tokens) used to compute\n\
+                      # `shillings_saved` in ledger.json. Edit freely (agents may too).\n\n";
+        let _ = std::fs::write(&path, format!("{header}{body}"));
+    }
+    rates
+}
 
 /// Just the user prompt(s): the system prompt, assistant turns, and
 /// tool-result messages are all dropped, leaving only what the user asked.
@@ -36,6 +76,7 @@ fn output_text(response: &Value) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::cast_precision_loss)]
 pub fn record(
     root: &Path,
     agent: &str,
@@ -77,6 +118,15 @@ pub fn record(
         entry[key] = json!(entry[key].as_u64().unwrap_or(0) + add);
     }
     entry["cost_usd"] = json!(entry["cost_usd"].as_f64().unwrap_or(0.0) + cost_usd);
+    // What these tokens would have cost on the Scrooge model (rates from
+    // .scrooge/rates.toml) less what they actually cost — the thrift of
+    // delegating to Cratchit, in plain USD.
+    let rates = load_rates(&dir);
+    let p = entry["prompt_tokens"].as_u64().unwrap_or(0) as f64;
+    let c = entry["completion_tokens"].as_u64().unwrap_or(0) as f64;
+    let scrooge_cost =
+        p * rates.scrooge_usd_per_mtok_in / 1e6 + c * rates.scrooge_usd_per_mtok_out / 1e6;
+    entry["shillings_saved"] = json!(scrooge_cost - entry["cost_usd"].as_f64().unwrap_or(0.0));
     if let Ok(s) = serde_json::to_string_pretty(&ledger) {
         let _ = std::fs::write(&path, s);
     }
@@ -103,6 +153,11 @@ mod tests {
         assert_eq!(ledger["scrooge"]["prompt_tokens"], 7);
         assert!((ledger["cratchit"]["cost_usd"].as_f64().unwrap() - 0.003).abs() < 1e-9);
         assert!((ledger["scrooge"]["cost_usd"].as_f64().unwrap() - 0.05).abs() < 1e-9);
+        // 150*$3/M + 15*$15/M - $0.003 actual = 0.000675 - 0.003
+        assert!(
+            (ledger["cratchit"]["shillings_saved"].as_f64().unwrap() - (0.000675 - 0.003)).abs()
+                < 1e-9
+        );
         let log = std::fs::read_to_string(scrooge_dir.join("accounts.log")).unwrap();
         assert_eq!(log.matches("=== ").count(), 3, "one header per call");
         assert!(log.contains("fix the bug"), "full request text logged");
