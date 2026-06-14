@@ -68,13 +68,6 @@ const CLIPPY_LINTS: &str = "-D warnings \
 fn defaults(root: &Path) -> BTreeMap<String, LangChecks> {
     let mut map = BTreeMap::new();
     if root.join("Cargo.toml").exists() {
-        // rust-code-analysis-cli reports cognitive/cyclomatic complexity per
-        // function. We run it after clippy and surface functions that exceed
-        // a cognitive complexity threshold of 20, but let clippy control
-        // whether the lint step as a whole passes or fails.
-        let rca = "rust-code-analysis-cli -m -p src/ 2>/dev/null \
-            | awk '/cognitive/{gsub(/[^0-9.]/,\" \",$0); for(i=1;i<=NF;i++) \
-              if($i+0>20){print \"High cognitive complexity (\"$i\"): \"FILENAME; break}}'";
         map.insert(
             "rust".into(),
             LangChecks {
@@ -87,9 +80,7 @@ fn defaults(root: &Path) -> BTreeMap<String, LangChecks> {
                     "cargo clippy --fix --allow-dirty --allow-staged --quiet -- {CLIPPY_LINTS} \
                      2>/dev/null"
                 )),
-                lint: Some(format!(
-                    "cargo clippy --quiet -- {CLIPPY_LINTS}; EC=$?; {rca}; exit $EC"
-                )),
+                lint: Some(format!("cargo clippy --quiet -- {CLIPPY_LINTS}")),
             },
         );
     }
