@@ -27,6 +27,10 @@ You are Scrooge, a senior software architect. Your time is extremely valuable, \
 so you receive only compressed briefs and you produce only terse, high-leverage output. \
 You never read full files, never write code, and never use tools. You direct Cratchit, \
 a junior agent with full tool access (files, shell, python, wolfram, docs, call graph).\n\
+You have ONE tool of your own, web_answer: a concise AI answer from the web. Use it \
+SPARINGLY — only when a library/dependency choice or a specific API detail would \
+materially change your plan and you are not sure of it. Never use it for code in this \
+repo; the brief already covers that. Most tasks need zero web_answer calls.\n\
 When given a task and a codebase brief, reply with a numbered plan of concrete steps \
 for Cratchit. Each step: one line, imperative, naming exact files/symbols where known. \
 Each numbered step is dispatched to a FRESH Cratchit in order, so every step must be \
@@ -160,9 +164,15 @@ const CRATCHIT_STOP: &str = "\
 STOP: tool budget exhausted. Send your final report for Scrooge now \
 — at most 6 lines: state reached, what remains, blockers. No tool calls.";
 
-/// Completion cap for Scrooge: plans are numbered one-liners, so anything
-/// past this is waste on the expensive model.
-const SCROOGE_MAX_TOKENS: u32 = 700;
+/// Completion cap for Scrooge: plans are numbered one-liners, but he may now
+/// fold a web-answer finding into a step's justification, so the cap is a
+/// little roomier than the bare-plan minimum.
+const SCROOGE_MAX_TOKENS: u32 = 1000;
+
+/// How many `web_answer` lookups Scrooge may make in a single planning turn
+/// before he is forced to emit the plan with no tools. Kept low to enforce
+/// "sparing" use in code, not just in the prompt.
+const SCROOGE_WEB_LOOKUPS: usize = 3;
 
 /// How many times a failing check report is routed straight back to Cratchit
 /// before the failure is escalated to Scrooge.
@@ -410,25 +420,7 @@ impl Orchestrator {
                 log.push(Message::text("user", format!("CRATCHIT REPORT:\n{report}")));
             }
 
-            let plan_msg = self
-                .client
-                .chat(
-                    "scrooge",
-                    &self.sota_model,
-                    &log,
-                    &[],
-                    Some(SCROOGE_MAX_TOKENS),
-                )
-                .await?;
-            let mut plan = plan_msg.content.unwrap_or_default();
-            if self.client.last_finish_reason.as_deref() == Some("length") {
-                // The plan was cut mid-step; drop the partial final line
-                // rather than handing Cratchit half an instruction.
-                if let Some(i) = plan.rfind('\n') {
-                    plan.truncate(i);
-                }
-                eprintln!("[scrooge hit the completion cap; dropped partial final step]");
-            }
+            let mut plan = self.scrooge_plan(&mut log).await?;
             eprintln!("--- scrooge (round {round}) ---\n{plan}\n");
 
             // DONE is accepted only while checks are green. With red checks
@@ -767,6 +759,64 @@ impl Orchestrator {
             }
         }
         Ok(kept)
+    }
+
+    /// Scrooge's planning turn. He may consult the `web_answer` tool a few
+    /// times (library/API lookups) before emitting the plan; those tool calls
+    /// don't count against the terse-output cap — only the final plan text
+    /// does. After `SCROOGE_WEB_LOOKUPS` lookups he is forced to plan with no
+    /// tools, keeping web use sparing in code rather than only in the prompt.
+    async fn scrooge_plan(&mut self, log: &mut Vec<Message>) -> Result<String> {
+        let defs = tools::scrooge_definitions();
+        for lookup in 0..=SCROOGE_WEB_LOOKUPS {
+            // The final allowed iteration withholds the tool so Scrooge cannot
+            // stall past the lookup budget without producing a plan.
+            let avail: &[Value] = if lookup < SCROOGE_WEB_LOOKUPS {
+                &defs
+            } else {
+                &[]
+            };
+            let msg = self
+                .client
+                .chat(
+                    "scrooge",
+                    &self.sota_model,
+                    log,
+                    avail,
+                    Some(SCROOGE_MAX_TOKENS),
+                )
+                .await?;
+            log.push(msg.clone());
+            let Some(calls) = msg.tool_calls.filter(|c| !c.is_empty()) else {
+                return Ok(self.trim_capped_plan(msg.content.unwrap_or_default()));
+            };
+            for call in calls {
+                let args: Value =
+                    serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
+                eprintln!(
+                    "  [scrooge] {}({})",
+                    call.function.name,
+                    arg_preview(&call.function.arguments)
+                );
+                let out = self.toolbox.call(&call.function.name, &args).await;
+                log.push(Message::tool_result(&call.id, out));
+            }
+        }
+        // Unreachable in practice: the last iteration has no tools and so
+        // returns above. Kept as a defensive fallback.
+        Ok(String::new())
+    }
+
+    /// Drop a final step that was cut off by the completion cap, rather than
+    /// handing Cratchit half an instruction.
+    fn trim_capped_plan(&self, mut plan: String) -> String {
+        if self.client.last_finish_reason.as_deref() == Some("length") {
+            if let Some(i) = plan.rfind('\n') {
+                plan.truncate(i);
+            }
+            eprintln!("[scrooge hit the completion cap; dropped partial final step]");
+        }
+        plan
     }
 
     /// Chat/tool loop shared by every Cratchit entry point: dispatch tool

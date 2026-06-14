@@ -153,6 +153,20 @@ pub fn definitions() -> Vec<Value> {
     ]
 }
 
+/// Scrooge's single tool. Unlike Cratchit he never touches files or the shell;
+/// his only reach beyond the brief is one cheap "web answer" to settle library
+/// or API questions before committing to a plan.
+pub fn scrooge_definitions() -> Vec<Value> {
+    vec![tool(
+        "web_answer",
+        "Get one concise AI-summarized answer from the web (Brave summarizer, not a link list). Use SPARINGLY — only to settle a library/dependency choice or a specific API/implementation detail you are unsure of before planning. Not for code in this repo (you already have the brief).",
+        &obj(
+            &json!({"query": {"type": "string", "description": "a focused question, e.g. 'best maintained rust crate for TOML parsing 2026' or 'does tokio::fs::read_to_string exist'"}}),
+            &["query"],
+        ),
+    )]
+}
+
 const MAX_OUTPUT: usize = 8000;
 
 /// Whole-file reads above this are refused with an outline instead, so the
@@ -377,6 +391,7 @@ impl Toolbox {
             "helpers" => crate::helpers::filtered_listing(&self.root, &s("filter")),
             "query_docs" => self.query_docs(&s("lang"), &s("query")).await,
             "search_libraries" => web_search(&s("query")).await,
+            "web_answer" => web_answer(&s("query")).await,
             "add_dependency" => {
                 let dev = args["dev"].as_bool().unwrap_or(false);
                 self.add_dependency(&s("lang"), &s("package"), dev).await
@@ -762,6 +777,37 @@ async fn web_search(query: &str) -> Result<String> {
         })
         .collect::<Vec<_>>()
         .join("\n"))
+}
+
+/// Brave's "Answers" product — one AI-generated answer backed by real-time
+/// web search, rather than a list of links. It is an OpenAI-compatible
+/// chat/completions endpoint (model `brave`), so a single request returns the
+/// answer text. Far cheaper on Scrooge's tokens than raw search results, which
+/// is why it is the only web tool he gets.
+async fn web_answer(query: &str) -> Result<String> {
+    let key = std::env::var("BRAVE_ANSWERS_KEY")
+        .map_err(|_| anyhow::anyhow!("BRAVE_ANSWERS_KEY is not set"))?;
+    let body: Value = reqwest::Client::new()
+        .post("https://api.search.brave.com/res/v1/chat/completions")
+        .bearer_auth(&key)
+        .json(&json!({
+            "model": "brave",
+            "stream": false,
+            "messages": [{"role": "user", "content": query}],
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let answer = body["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .trim();
+    if answer.is_empty() {
+        return Ok("no web answer available for that query".into());
+    }
+    Ok(answer.to_string())
 }
 
 async fn fetch_text(url: &str) -> Result<String> {
