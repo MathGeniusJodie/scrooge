@@ -4,3 +4,4 @@
 /.scrooge/accounts.log
 /.scrooge/ledger.json
 /plugin/bin/scrooge
+plugin/hooks/__pycache__/session_start.cpython-314.pyc
