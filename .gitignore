@@ -1,5 +1,5 @@
 /target
 /.scrooge/dirty
 /.scrooge/check_attempts
-accounts.log
-ledger.json
+/.scrooge/accounts.log
+/.scrooge/ledger.json
