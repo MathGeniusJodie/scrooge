@@ -296,38 +296,6 @@ fn digest_steps(reports: &[String]) -> String {
     out.join("\n")
 }
 
-/// Tool results older than this many assistant turns are evicted from
-/// Cratchit's log — without this, every old file dump is re-paid on each of
-/// up to 40 loop iterations (quadratic growth).
-const EVICT_AFTER_TURNS: usize = 8;
-const EVICT_MIN_CHARS: usize = 400;
-
-/// Replace large tool results older than `EVICT_AFTER_TURNS` assistant turns
-/// with a stub. The model can always re-run a tool it still needs.
-fn evict_old_tool_results(log: &mut [Message]) {
-    let assistants: Vec<usize> = log
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| m.role == "assistant")
-        .map(|(i, _)| i)
-        .collect();
-    if assistants.len() <= EVICT_AFTER_TURNS {
-        return;
-    }
-    let cutoff = assistants[assistants.len() - EVICT_AFTER_TURNS];
-    for m in &mut log[..cutoff] {
-        if m.role == "tool"
-            && m.content
-                .as_deref()
-                .is_some_and(|c| c.len() > EVICT_MIN_CHARS)
-        {
-            m.content = Some(
-                "[old result evicted to save tokens — re-run the tool if still needed]".into(),
-            );
-        }
-    }
-}
-
 /// Short stderr preview of tool-call arguments — a full `write_file` body
 /// would make the log unreadable.
 fn arg_preview(args: &str) -> String {
@@ -879,8 +847,8 @@ impl Orchestrator {
     }
 
     /// Chat/tool loop shared by every Cratchit entry point: dispatch tool
-    /// calls (evicting stale results as the log grows) until the model
-    /// replies with text, or return None when `max_iters` is exhausted.
+    /// calls until the model replies with text, or return None when
+    /// `max_iters` is exhausted.
     async fn tool_loop(
         &mut self,
         log: &mut Vec<Message>,
@@ -888,7 +856,6 @@ impl Orchestrator {
         max_iters: usize,
     ) -> Result<Option<String>> {
         for _ in 0..max_iters {
-            evict_old_tool_results(log);
             let msg = self
                 .client
                 .chat("cratchit", &self.cheap_model, log, defs, None)
@@ -1013,28 +980,5 @@ mod tests {
         assert!(!is_unchanged_verdict(
             "Scrooge is a token-miserly coding agent.\nIt splits planning from execution."
         ));
-    }
-
-    #[test]
-    fn eviction_stubs_only_old_large_tool_results() {
-        let big = "x".repeat(EVICT_MIN_CHARS + 1);
-        let mut log = vec![Message::text("system", "s"), Message::text("user", "u")];
-        for _ in 0..EVICT_AFTER_TURNS + 2 {
-            log.push(Message::text("assistant", "call"));
-            log.push(Message::tool_result("id", big.clone()));
-        }
-        evict_old_tool_results(&mut log);
-        let stubs = log
-            .iter()
-            .filter(|m| {
-                m.role == "tool" && m.content.as_deref().is_some_and(|c| c.starts_with("[old"))
-            })
-            .count();
-        assert_eq!(stubs, 2, "only results older than the keep window evicted");
-        // recent results untouched
-        assert!(
-            log.last().unwrap().content.as_deref() == Some(big.as_str()),
-            "most recent tool result must survive"
-        );
     }
 }
