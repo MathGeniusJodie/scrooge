@@ -132,6 +132,18 @@ pub fn record(
     }
 }
 
+/// What `prompt`/`completion` tokens would have cost on the Scrooge model
+/// (rates from .scrooge/rates.toml) less the `cost_usd` actually paid — the
+/// thrift of delegating to Cratchit, in plain USD. `root` is the project root
+/// (the rates file lives under its .scrooge/ directory).
+#[allow(clippy::cast_precision_loss)]
+pub fn shillings_saved(root: &Path, prompt: u64, completion: u64, cost_usd: f64) -> f64 {
+    let rates = load_rates(&root.join(".scrooge"));
+    let scrooge_cost = prompt as f64 * rates.scrooge_usd_per_mtok_in / 1e6
+        + completion as f64 * rates.scrooge_usd_per_mtok_out / 1e6;
+    scrooge_cost - cost_usd
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

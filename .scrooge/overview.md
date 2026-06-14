@@ -1,3 +1,3 @@
-The changes in this session are cosmetic and ergonomic: a `humbugs` CLI subcommand (alias for `check`), Dickensian flavor text in check output messages, an enhanced CLI `long_about` description, and a label rename ("cratchit tokens" → "Cratchit's wages"). None of these alter the project's purpose, architecture, tool definitions, or invariants. The check suite pipeline (formatters→tests→lint), the orchestrator delegation model, and the plugin hook logic are all untouched.
+The overview accurately describes the session's changes and correctly states that the project's purpose, architecture, tool definitions, and invariants are untouched. The `humbugs` alias, "Bah! Humbug!" flavor text, `long_about` enhancement, and `Cratchit's Wages` footer are all cosmetic/ergonomic output additions. No new architectural components, no changed delegation model, no altered invariants.
 
 UNCHANGED

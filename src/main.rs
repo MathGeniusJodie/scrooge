@@ -97,11 +97,13 @@ async fn main() -> Result<()> {
         }
         Cmd::Run { task } => {
             let mut orch = agents::Orchestrator::new(root)?;
-            println!("{}", orch.run_task(&task).await?);
+            let out = orch.run_task(&task).await?;
+            println!("{out}{}", orch.wages_footer());
         }
         Cmd::Cratchit { task } => {
             let mut orch = agents::Orchestrator::new(root)?;
-            println!("{}", orch.delegate(&task, &task).await?);
+            let out = orch.delegate(&task, &task).await?;
+            println!("{out}{}", orch.wages_footer());
         }
         Cmd::McpServe => mcp::Server::new(root).run().await?,
         Cmd::Practices { text } => print!("{}", practices::relevant_sections(&text)),

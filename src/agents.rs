@@ -15,6 +15,7 @@ use serde_json::Value;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
+use crate::accounting;
 use crate::checks;
 use crate::codemap;
 use crate::helpers::Helper;
@@ -601,6 +602,24 @@ impl Orchestrator {
         format!(
             "task complete in {round} round(s). tokens: {} in / {} out (${:.4})",
             u.prompt_tokens, u.completion_tokens, u.cost_usd
+        )
+    }
+
+    /// Two-line footer for `scrooge run`/`scrooge cratchit`: what this request
+    /// actually cost (Cratchit's wages) and the shillings saved versus running
+    /// it all on the pricey Scrooge model. The usage is per-request because the
+    /// orchestrator is built fresh for each command invocation.
+    pub fn wages_footer(&self) -> String {
+        let u = &self.client.usage;
+        let saved = accounting::shillings_saved(
+            &self.toolbox.root,
+            u.prompt_tokens,
+            u.completion_tokens,
+            u.cost_usd,
+        );
+        format!(
+            "\nCratchit's Wages: ${:.4}\nShillings saved: ${saved:.4}",
+            u.cost_usd
         )
     }
 
