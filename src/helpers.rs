@@ -168,6 +168,22 @@ pub fn dep_helpers(root: &Path) -> Vec<Helper> {
     out
 }
 
+/// (name, path) for each immediate subdirectory of `dir`, skipping entries
+/// whose name isn't valid UTF-8. Empty if `dir` can't be read.
+fn dir_subdirs(dir: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            let name = p.file_name()?.to_str()?.to_string();
+            p.is_dir().then_some((name, p))
+        })
+        .collect()
+}
+
 /// Cargo dependencies via `cargo metadata`: every non-workspace package's
 /// source directory in the registry checkout.
 fn rust_deps(root: &Path) -> Result<Vec<(String, PathBuf)>> {
@@ -244,22 +260,12 @@ fn python_deps(root: &Path) -> Vec<(String, PathBuf)> {
     ];
     let mut deps = Vec::new();
     for sp in site_dirs {
-        let Ok(entries) = std::fs::read_dir(&sp) else {
-            continue;
-        };
-        for e in entries.flatten() {
-            let p = e.path();
-            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if !p.is_dir()
-                || name.contains("dist-info")
-                || name.starts_with('_')
-                || skip.contains(&name)
+        for (name, p) in dir_subdirs(&sp) {
+            if name.contains("dist-info") || name.starts_with('_') || skip.contains(&name.as_str())
             {
                 continue;
             }
-            deps.push((name.to_string(), p));
+            deps.push((name, p));
         }
     }
     deps
@@ -269,29 +275,16 @@ fn python_deps(root: &Path) -> Vec<(String, PathBuf)> {
 fn js_deps(root: &Path) -> Vec<(String, PathBuf)> {
     let nm = root.join("node_modules");
     let mut deps = Vec::new();
-    let Ok(entries) = std::fs::read_dir(&nm) else {
-        return deps;
-    };
-    for e in entries.flatten() {
-        let p = e.path();
-        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if !p.is_dir() || name == ".bin" {
+    for (name, p) in dir_subdirs(&nm) {
+        if name == ".bin" {
             continue;
         }
         if let Some(scope) = name.strip_prefix('@') {
-            if let Ok(inner) = std::fs::read_dir(&p) {
-                for s in inner.flatten() {
-                    if let Some(sub) = s.path().file_name().and_then(|n| n.to_str())
-                        && s.path().is_dir()
-                    {
-                        deps.push((format!("@{scope}/{sub}"), s.path()));
-                    }
-                }
+            for (sub, sp) in dir_subdirs(&p) {
+                deps.push((format!("@{scope}/{sub}"), sp));
             }
         } else {
-            deps.push((name.to_string(), p));
+            deps.push((name, p));
         }
     }
     deps

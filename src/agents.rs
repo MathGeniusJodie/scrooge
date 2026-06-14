@@ -19,7 +19,7 @@ use crate::accounting;
 use crate::checks;
 use crate::codemap;
 use crate::helpers::Helper;
-use crate::openrouter::{Client, DEV_MODEL_CHEAP, DEV_MODEL_SOTA, Message};
+use crate::openrouter::{Client, DEV_MODEL_CHEAP, DEV_MODEL_SOTA, Message, ToolCall};
 use crate::practices;
 use crate::tools::{self, Toolbox};
 
@@ -859,17 +859,7 @@ impl Orchestrator {
             let Some(calls) = msg.tool_calls.filter(|c| !c.is_empty()) else {
                 return Ok(self.trim_capped_plan(msg.content.unwrap_or_default()));
             };
-            for call in calls {
-                let args: Value =
-                    serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
-                eprintln!(
-                    "  [scrooge] {}({})",
-                    call.function.name,
-                    arg_preview(&call.function.arguments)
-                );
-                let out = self.toolbox.call(&call.function.name, &args).await;
-                log.push(Message::tool_result(&call.id, out));
-            }
+            self.dispatch_calls(log, calls, "scrooge").await;
         }
         // Unreachable in practice: the last iteration has no tools and so
         // returns above. Kept as a defensive fallback.
@@ -907,19 +897,24 @@ impl Orchestrator {
             let Some(calls) = msg.tool_calls.filter(|c| !c.is_empty()) else {
                 return Ok(Some(msg.content.unwrap_or_default()));
             };
-            for call in calls {
-                let args: Value =
-                    serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
-                eprintln!(
-                    "  [cratchit] {}({})",
-                    call.function.name,
-                    arg_preview(&call.function.arguments)
-                );
-                let out = self.toolbox.call(&call.function.name, &args).await;
-                log.push(Message::tool_result(&call.id, out));
-            }
+            self.dispatch_calls(log, calls, "cratchit").await;
         }
         Ok(None)
+    }
+
+    /// Run each tool call the model emitted, tracing a preview and appending
+    /// the result to the log. `who` labels the trace line (scrooge/cratchit).
+    async fn dispatch_calls(&self, log: &mut Vec<Message>, calls: Vec<ToolCall>, who: &str) {
+        for call in calls {
+            let args: Value = serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
+            eprintln!(
+                "  [{who}] {}({})",
+                call.function.name,
+                arg_preview(&call.function.arguments)
+            );
+            let out = self.toolbox.call(&call.function.name, &args).await;
+            log.push(Message::tool_result(&call.id, out));
+        }
     }
 
     async fn cratchit_execute(
