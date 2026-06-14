@@ -641,10 +641,7 @@ impl Orchestrator {
     /// Completion banner with the cumulative token bill.
     fn bill(&self, round: usize) -> String {
         let u = &self.client.usage;
-        format!(
-            "task complete in {round} round(s). tokens: {} in / {} out (${:.4})",
-            u.prompt_tokens, u.completion_tokens, u.cost_usd
-        )
+        format!("task complete in {round} round(s).", u.prompt_tokens)
     }
 
     /// Two-line footer for `scrooge run`/`scrooge cratchit`: what this request
