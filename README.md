@@ -15,6 +15,8 @@ Currently supports rust, python and html/css/js. lua support is planned.
 
 ```sh
 scrooge run "fix the off-by-one in pagination"   # full plan/execute/review loop
+scrooge cratchit "rename foo to bar everywhere"  # hand straight to cratchit, no planning
+scrooge humbugs                                  # find every humbug: format, tests, lint
 scrooge ask "where is auth handled?"             # one-shot, cratchit only
 scrooge map                                      # codebase brief (free, no LLM)
 scrooge sym <name>                               # signature + callers + callees
@@ -22,7 +24,6 @@ scrooge callers <fn> / scrooge callees <fn>      # call-graph queries
 scrooge -r path/to/project ...                   # operate on another project
 scrooge helpers                                  # generic utilities in the repo (heuristic, free)
 scrooge helpers --deps --validate                # + all dependencies, filtered by Cratchit
-scrooge humbugs                                  # find every humbug: format, tests, lint
 ```
 
 ## Claude Code plugin mode

@@ -29,6 +29,9 @@ struct Cli {
 enum Cmd {
     /// Run a coding task through the Scrooge/Cratchit loop.
     Run { task: String },
+    /// Hand a task straight to Cratchit (cheap model, full tools), skipping
+    /// Scrooge's planning step. The task doubles as the instructions.
+    Cratchit { task: String },
     /// Ask a one-shot question (Cratchit only, with tools).
     Ask { question: String },
     /// Print the compact codebase brief (no LLM, free).
@@ -88,6 +91,10 @@ async fn main() -> Result<()> {
         Cmd::Run { task } => {
             let mut orch = agents::Orchestrator::new(root)?;
             println!("{}", orch.run_task(&task).await?);
+        }
+        Cmd::Cratchit { task } => {
+            let mut orch = agents::Orchestrator::new(root)?;
+            println!("{}", orch.delegate(&task, &task).await?);
         }
         Cmd::McpServe => mcp::Server::new(root).run().await?,
         Cmd::Practices { text } => print!("{}", practices::relevant_sections(&text)),
