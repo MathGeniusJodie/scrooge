@@ -1,4 +1,4 @@
-# scrooge coding agent
+# Scrooge Coding Agent (WIP)
 
 ![scrooge logo](https://github.com/MathGeniusJodie/scrooge/blob/master/logo.png?raw=true)
 
