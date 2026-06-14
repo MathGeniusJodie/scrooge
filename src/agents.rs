@@ -236,6 +236,18 @@ fn clamp_report(s: &str) -> String {
     out
 }
 
+/// True when an overview-review reply means "no rewrite needed". The model is
+/// asked for the single word UNCHANGED but often prefaces it with a sentence of
+/// reasoning ("The architecture is unchanged. UNCHANGED"), so treat the reply
+/// as a verdict if any line, stripped of markdown emphasis/punctuation, is just
+/// UNCHANGED — rather than only the exact-string case.
+fn is_unchanged_verdict(text: &str) -> bool {
+    text.lines().any(|l| {
+        let l = l.trim().trim_matches(|c: char| !c.is_alphanumeric());
+        l.eq_ignore_ascii_case("UNCHANGED")
+    })
+}
+
 /// Split Scrooge's numbered plan into steps ("1. ..." / "2) ..."); unnumbered
 /// continuation lines stick to their step. A plan with no numbering is one
 /// step. Each step gets its own fresh Cratchit.
@@ -461,7 +473,7 @@ impl Orchestrator {
                     if checks_clean == Some(true) {
                         self.refresh_overview(task).await;
                     }
-                    return Ok(self.bill(round));
+                    return Ok(Self::bill(round));
                 }
                 let failures = last_report
                     .as_deref()
@@ -514,7 +526,7 @@ impl Orchestrator {
             if done_pending && checks_clean == Some(true) {
                 // Scrooge already ruled DONE pending green checks.
                 self.refresh_overview(task).await;
-                return Ok(self.bill(round));
+                return Ok(Self::bill(round));
             }
             let report = digest_steps(&step_reports);
             eprintln!("--- cratchit report ---\n{report}\n");
@@ -626,7 +638,7 @@ impl Orchestrator {
         let instructions = OVERVIEW_REFRESH_INSTRUCTIONS.replace("{CHANGED}", &changed);
         match self.cratchit_overview(task, &instructions).await {
             Ok(text) => {
-                if text.is_empty() || text.eq_ignore_ascii_case("UNCHANGED") {
+                if text.is_empty() || is_unchanged_verdict(&text) {
                     eprintln!("--- overview review: unchanged ---");
                 } else if let Err(e) = crate::overview::save(&root, &text) {
                     eprintln!("[overview save failed (task still complete): {e:#}]");
@@ -638,10 +650,9 @@ impl Orchestrator {
         }
     }
 
-    /// Completion banner with the cumulative token bill.
-    fn bill(&self, round: usize) -> String {
-        let u = &self.client.usage;
-        format!("task complete in {round} round(s).", u.prompt_tokens)
+    /// Completion banner. The token/cost accounting lives in `wages_footer`.
+    fn bill(round: usize) -> String {
+        format!("task complete in {round} round(s).")
     }
 
     /// Two-line footer for `scrooge run`/`scrooge cratchit`: what this request
@@ -993,6 +1004,20 @@ mod tests {
         assert!(steps[1].contains("mcp.rs"), "continuation line attached");
         // unnumbered plan = single step
         assert_eq!(plan_steps("just fix the bug").len(), 1);
+    }
+
+    #[test]
+    fn unchanged_verdict_tolerates_preamble() {
+        assert!(is_unchanged_verdict("UNCHANGED"));
+        assert!(is_unchanged_verdict(
+            "The architecture still holds.\nUNCHANGED"
+        ));
+        assert!(is_unchanged_verdict("**UNCHANGED**"));
+        assert!(is_unchanged_verdict("unchanged."));
+        // A real rewritten overview is not a verdict.
+        assert!(!is_unchanged_verdict(
+            "Scrooge is a token-miserly coding agent.\nIt splits planning from execution."
+        ));
     }
 
     #[test]
