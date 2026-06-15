@@ -317,15 +317,21 @@ fn worktree_changes(root: &Path) -> Option<String> {
     Some(format!("{diff}\n{untracked}").trim().to_string())
 }
 
-/// Parse tool-call arguments, tolerating an object truncated at the end by an
-/// output cap (`finish_reason: length`). A capped Scrooge turn can cut the
-/// arguments mid-value; rather than spend another turn, we close whatever was
-/// left open and run with the surviving (truncated) instruction. Falls back to
-/// `Null` only when even the repair won't parse.
-fn parse_tool_args(raw: &str) -> Value {
-    serde_json::from_str(raw)
-        .or_else(|_| serde_json::from_str(&close_truncated_json(raw)))
-        .unwrap_or(Value::Null)
+/// Parse tool-call arguments. A well-formed object always parses. When the
+/// completion was cut short by an output cap (`finish_reason: length`, passed as
+/// `truncated`), the arguments can be clipped mid-value; rather than spend
+/// another turn we close whatever was left open and run with the surviving
+/// (truncated) instruction. When the response was NOT truncated, a parse failure
+/// is genuine malformed JSON, not a clip — we do not guess, returning `Null` so
+/// the caller can reject the call instead of acting on a blind repair.
+fn parse_tool_args(raw: &str, truncated: bool) -> Value {
+    if let Ok(v) = serde_json::from_str(raw) {
+        return v;
+    }
+    if truncated && let Ok(v) = serde_json::from_str(&close_truncated_json(raw)) {
+        return v;
+    }
+    Value::Null
 }
 
 /// Best-effort close of a JSON fragment cut off at the end: balance an open
@@ -470,42 +476,27 @@ impl Orchestrator {
                 continue; // checks red — try_finish nudged Scrooge to fix them
             };
 
+            // A turn cut off by the output cap may carry a clipped tool call;
+            // only then do we let parse_tool_args attempt a repair.
+            let truncated = self.client.last_finish_reason.as_deref() == Some("length");
+            // At most one delegation per turn: Cratchit's report (and its CHECKS
+            // verdict) must come back before the next step is planned, so a
+            // second delegate call in the same turn was planned blind.
+            let mut delegated = false;
             for call in calls {
-                let args: Value = parse_tool_args(&call.function.arguments);
-                let name = call.function.name.clone();
-                let result = if name == "delegate_to_cratchit" {
-                    let instructions = args["instructions"].as_str().unwrap_or("").to_string();
-                    delegations += 1;
-                    self.run_delegation(
+                let result = self
+                    .run_scrooge_call(
                         task,
-                        &instructions,
-                        delegations,
+                        &call,
+                        truncated,
+                        &mut delegated,
+                        &mut delegations,
+                        &mut web_calls,
                         &mut last_report,
                         &mut checks_clean,
                         &mut dirty,
                     )
-                    .await?
-                } else if name == "web_answer" {
-                    if web_calls >= SCROOGE_WEB_LOOKUPS {
-                        "web_answer budget exhausted — decide with what you have and delegate."
-                            .to_string()
-                    } else {
-                        web_calls += 1;
-                        eprintln!(
-                            "  [scrooge] {name}({})",
-                            arg_preview(&call.function.arguments)
-                        );
-                        self.toolbox.call(&name, &args).await
-                    }
-                } else {
-                    // Free, deterministic call-graph lookups (symbol_info /
-                    // callers / callees) — answered locally, no Cratchit round.
-                    eprintln!(
-                        "  [scrooge] {name}({})",
-                        arg_preview(&call.function.arguments)
-                    );
-                    self.toolbox.call(&name, &args).await
-                };
+                    .await?;
                 log.push(Message::tool_result(&call.id, result));
             }
         }
@@ -534,6 +525,77 @@ impl Orchestrator {
         eprintln!("--- cratchit report ---\n{report}\n");
         *last_report = Some(report.clone());
         Ok(report)
+    }
+
+    /// Handle one tool call Scrooge emitted, returning the string fed back as
+    /// its tool result. `delegated` carries the one-delegation-per-turn state
+    /// across the turn's calls; the free call-graph lookups and the budgeted
+    /// `web_answer` are answered locally without a Cratchit round.
+    async fn run_scrooge_call(
+        &mut self,
+        task: &str,
+        call: &ToolCall,
+        truncated: bool,
+        delegated: &mut bool,
+        delegations: &mut usize,
+        web_calls: &mut usize,
+        last_report: &mut Option<String>,
+        checks_clean: &mut Option<bool>,
+        dirty: &mut bool,
+    ) -> Result<String> {
+        let args: Value = parse_tool_args(&call.function.arguments, truncated);
+        let name = call.function.name.clone();
+        if name == "delegate_to_cratchit" {
+            let instructions = args["instructions"]
+                .as_str()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if instructions.is_empty() {
+                // Empty or unrepairable args: bounce it back rather than burn a
+                // delegation briefing Cratchit with nothing.
+                return Ok(
+                    "error: delegate_to_cratchit needs a non-empty `instructions` string; \
+                           the call arrived empty or malformed — re-issue the step."
+                        .to_string(),
+                );
+            }
+            if *delegated {
+                return Ok(
+                    "error: only one delegate_to_cratchit per turn — wait for this step's \
+                           report before issuing the next."
+                        .to_string(),
+                );
+            }
+            *delegated = true;
+            *delegations += 1;
+            return self
+                .run_delegation(
+                    task,
+                    &instructions,
+                    *delegations,
+                    last_report,
+                    checks_clean,
+                    dirty,
+                )
+                .await;
+        }
+        if name == "web_answer" {
+            if *web_calls >= SCROOGE_WEB_LOOKUPS {
+                return Ok(
+                    "web_answer budget exhausted — decide with what you have and delegate."
+                        .to_string(),
+                );
+            }
+            *web_calls += 1;
+        }
+        // web_answer (within budget) and the free, deterministic call-graph
+        // lookups (symbol_info / callers / callees) are answered locally.
+        eprintln!(
+            "  [scrooge] {name}({})",
+            arg_preview(&call.function.arguments)
+        );
+        Ok(self.toolbox.call(&name, &args).await)
     }
 
     /// Handle Scrooge ending his turn without a tool call: decide whether the
@@ -877,16 +939,23 @@ impl Orchestrator {
             let Some(calls) = msg.tool_calls.filter(|c| !c.is_empty()) else {
                 return Ok(Some(msg.content.unwrap_or_default()));
             };
-            self.dispatch_calls(log, calls, "cratchit").await;
+            let truncated = self.client.last_finish_reason.as_deref() == Some("length");
+            self.dispatch_calls(log, calls, "cratchit", truncated).await;
         }
         Ok(None)
     }
 
     /// Run each tool call the model emitted, tracing a preview and appending
     /// the result to the log. `who` labels the trace line (scrooge/cratchit).
-    async fn dispatch_calls(&self, log: &mut Vec<Message>, calls: Vec<ToolCall>, who: &str) {
+    async fn dispatch_calls(
+        &self,
+        log: &mut Vec<Message>,
+        calls: Vec<ToolCall>,
+        who: &str,
+        truncated: bool,
+    ) {
         for call in calls {
-            let args: Value = parse_tool_args(&call.function.arguments);
+            let args: Value = parse_tool_args(&call.function.arguments, truncated);
             eprintln!(
                 "  [{who}] {}({})",
                 call.function.name,
@@ -1024,24 +1093,31 @@ mod tests {
 
     #[test]
     fn parse_tool_args_recovers_truncated_instruction() {
-        // Well-formed args parse normally.
-        let v = parse_tool_args(r#"{"instructions": "edit foo.rs"}"#);
+        // Well-formed args parse regardless of the truncation flag.
+        let v = parse_tool_args(r#"{"instructions": "edit foo.rs"}"#, false);
         assert_eq!(v["instructions"], "edit foo.rs");
 
-        // Cut mid-string (the output cap's typical landing spot): the surviving
-        // prefix is kept, truncated.
-        let v = parse_tool_args(r#"{"instructions": "edit foo.rs and rename bar to ba"#);
+        // Cut mid-string (the output cap's typical landing spot): with the
+        // truncation flag set, the surviving prefix is kept.
+        let v = parse_tool_args(
+            r#"{"instructions": "edit foo.rs and rename bar to ba"#,
+            true,
+        );
         assert_eq!(v["instructions"], "edit foo.rs and rename bar to ba");
 
         // Cut right after an escaped quote inside the string.
-        let v = parse_tool_args(r#"{"instructions": "set the flag to \"on"#);
+        let v = parse_tool_args(r#"{"instructions": "set the flag to \"on"#, true);
         assert_eq!(v["instructions"], "set the flag to \"on");
 
         // Cut between fields, leaving a dangling comma.
-        let v = parse_tool_args(r#"{"instructions": "do it","#);
+        let v = parse_tool_args(r#"{"instructions": "do it","#, true);
         assert_eq!(v["instructions"], "do it");
 
         // Unrecoverable garbage falls back to Null rather than panicking.
-        assert!(parse_tool_args("{not json at all").is_null());
+        assert!(parse_tool_args("{not json at all", true).is_null());
+
+        // Without the truncation signal, broken JSON is NOT repaired — a genuine
+        // malformed call returns Null instead of a guessed (partial) value.
+        assert!(parse_tool_args(r#"{"instructions": "edit foo.rs and rename"#, false).is_null());
     }
 }

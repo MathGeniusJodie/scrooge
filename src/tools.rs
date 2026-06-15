@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 use crate::codemap;
-use crate::practices;
 
 pub struct Toolbox {
     pub root: PathBuf,
@@ -26,10 +25,9 @@ fn obj(props: &Value, required: &[&str]) -> Value {
     json!({ "type": "object", "properties": props, "required": required })
 }
 
-/// Definitions ride on every model call, so they are kept terse. The
-/// `code_map` and `best_practices` bodies are no longer listed: both are
-/// injected into Cratchit's briefing deterministically (the handlers remain
-/// callable for other entry points).
+/// Definitions ride on every model call, so they are kept terse. `code_map`
+/// and `best_practices` are not listed (and have no dispatch handler): both are
+/// injected into Cratchit's briefing deterministically.
 // A flat data table of tool schemas — long by nature, not a refactor target.
 #[allow(clippy::too_many_lines)]
 pub fn definitions() -> Vec<Value> {
@@ -426,7 +424,6 @@ impl Toolbox {
                 self.run("wolframscript", &["-code", &s("expression")])
                     .await
             }
-            "code_map" => Ok(codemap::build_cached(&self.root)?.brief()),
             "symbol_info" => Ok(codemap::build_cached(&self.root)?.detail(&s("name"))),
             "callers" => {
                 let m = codemap::build_cached(&self.root)?;
@@ -444,10 +441,6 @@ impl Toolbox {
                 let dev = args["dev"].as_bool().unwrap_or(false);
                 self.add_dependency(&s("lang"), &s("package"), dev).await
             }
-            "best_practices" => Ok(practices::relevant_sections(
-                &s("topic"),
-                &crate::codemap::build_cached(&self.root)?.languages(),
-            )),
             _ => anyhow::bail!("unknown tool {name}"),
         }
     }
