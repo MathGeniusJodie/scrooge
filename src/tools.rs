@@ -175,8 +175,7 @@ pub fn scrooge_definitions() -> Vec<Value> {
              change, spend one call purely to investigate — tell him to read the relevant \
              files and report, changing nothing. Instructions must be standalone and \
              imperative, naming exact files/symbols. A step that changes code returns a \
-             report ending with a CHECKS verdict (a fast per-step compile \
-             check). Call ONCE per turn.",
+             report ending with a CHECKS verdict (a compile check). Call ONCE per turn.",
             &obj(
                 &json!({"instructions": {"type": "string", "description": "standalone imperative step for Cratchit to execute and verify"}}),
                 &["instructions"],
@@ -184,17 +183,17 @@ pub fn scrooge_definitions() -> Vec<Value> {
         ),
         tool(
             "symbol_info",
-            "Free, instant lookup: signature, location, callers and callees of a symbol. Use it to judge the blast radius of a change before delegating — it costs nothing.",
+            "signature, location, callers and callees of a symbol. Use it to judge the blast radius of a change before delegating",
             &obj(&json!({"name": {"type": "string"}}), &["name"]),
         ),
         tool(
             "callers",
-            "Free, instant lookup: the functions that call the named function.",
+            "the functions that call the named function.",
             &obj(&json!({"name": {"type": "string"}}), &["name"]),
         ),
         tool(
             "callees",
-            "Free, instant lookup: the functions the named function calls.",
+            "the functions the named function calls.",
             &obj(&json!({"name": {"type": "string"}}), &["name"]),
         ),
         tool(
