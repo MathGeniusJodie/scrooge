@@ -309,6 +309,41 @@ fn worktree_changes(root: &Path) -> Option<String> {
     Some(format!("{diff}\n{untracked}").trim().to_string())
 }
 
+/// A content fingerprint of the worktree: the git tree OID of every tracked and
+/// untracked (non-ignored) file's current bytes, captured through a throwaway
+/// index so the real index is untouched. Unlike a `--stat` summary it changes
+/// whenever the edited bytes change — two edits that net the same insertion/
+/// deletion counts still produce different fingerprints, and a brand-new file
+/// that is then modified is caught too — so a real change is never mistaken for
+/// a read-only step. None when the root is not a git repo (or git is missing).
+fn worktree_fingerprint(root: &Path) -> Option<String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Unique per call so concurrent orchestrators (e.g. parallel tests) never
+    // share a temp index and corrupt each other's snapshot.
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let index = std::env::temp_dir().join(format!(
+        "scrooge-index-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_file(&index);
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_INDEX_FILE", &index)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    // Stage the whole worktree into the scratch index, then hash it to a tree.
+    git(&["add", "-A"])?;
+    let tree = git(&["write-tree"]);
+    let _ = std::fs::remove_file(&index);
+    tree
+}
+
 /// Parse tool-call arguments. A well-formed object always parses. When the
 /// completion was cut short by an output cap (`finish_reason: length`, passed as
 /// `truncated`), the arguments can be clipped mid-value; rather than spend
@@ -380,8 +415,11 @@ fn close_truncated_json(raw: &str) -> String {
 /// `&mut` scalars (which previously pushed those helpers past 8–10 arguments).
 #[derive(Default)]
 struct RunState {
-    /// Delegations issued so far (also the step number).
-    delegations: usize,
+    /// Scrooge planning turns taken — the loop's only budget. Every Scrooge
+    /// completion counts (a delegation *and* a free call-graph lookup alike),
+    /// so a model that only ever issues free lookups can no longer spin the
+    /// loop forever without advancing.
+    turns: usize,
     /// `web_answer` lookups Scrooge has spent against `SCROOGE_WEB_LOOKUPS`.
     web_calls: usize,
     /// Cratchit's most recent report, fed into the next briefing.
@@ -399,7 +437,7 @@ pub struct Orchestrator<C = Client> {
     toolbox: Toolbox,
     cheap_model: String,
     sota_model: String,
-    max_steps: usize,
+    max_turns: usize,
 }
 
 impl Orchestrator<Client> {
@@ -409,7 +447,7 @@ impl Orchestrator<Client> {
             toolbox: Toolbox::new(root),
             cheap_model: std::env::var("CRATCHIT_MODEL").unwrap_or_else(|_| DEV_MODEL_CHEAP.into()),
             sota_model: std::env::var("SCROOGE_MODEL").unwrap_or_else(|_| DEV_MODEL_SOTA.into()),
-            max_steps: 20,
+            max_turns: 20,
         })
     }
 }
@@ -451,9 +489,10 @@ impl<C: Chat + Send + Sync> Orchestrator<C> {
         let mut st = RunState::default();
 
         loop {
-            if st.delegations >= self.max_steps {
+            if st.turns >= self.max_turns {
                 break;
             }
+            st.turns += 1;
             let msg = self
                 .client
                 .chat(
@@ -491,7 +530,7 @@ impl<C: Chat + Send + Sync> Orchestrator<C> {
                 log.push(Message::tool_result(&call.id, result));
             }
         }
-        Ok("step limit reached without DONE; review output above".into())
+        Ok("turn limit reached without DONE; review output above".into())
     }
 
     /// Run one Scrooge delegation: execute + verify, fold the verdict into the
@@ -503,8 +542,8 @@ impl<C: Chat + Send + Sync> Orchestrator<C> {
         st: &mut RunState,
     ) -> Result<String> {
         eprintln!(
-            "--- scrooge → cratchit (step {}) ---\n{instructions}\n",
-            st.delegations
+            "--- scrooge → cratchit (turn {}) ---\n{instructions}\n",
+            st.turns
         );
         let (report, verdict) = self
             .execute_and_verify(
@@ -560,7 +599,6 @@ impl<C: Chat + Send + Sync> Orchestrator<C> {
                 );
             }
             *delegated = true;
-            st.delegations += 1;
             return self.run_delegation(task, &instructions, st).await;
         }
         if name == "web_answer" {
@@ -595,7 +633,7 @@ impl<C: Chat + Send + Sync> Orchestrator<C> {
         structure_before: &[String],
     ) -> Result<Option<String>> {
         if !st.dirty {
-            return Ok(Some(Self::bill(st.delegations))); // nothing changed to verify
+            return Ok(Some(Self::bill(st.turns))); // nothing changed to verify
         }
         if st.checks_clean == Some(false) {
             // Quick checks from the last step are still red.
@@ -626,14 +664,16 @@ impl<C: Chat + Send + Sync> Orchestrator<C> {
         // Only reconsider the overview when the change was structural — a pure
         // internal edit (no added/removed/renamed symbols or changed signatures)
         // can't make the architecture description stale, so skip the extra
-        // Cratchit pass (#4).
+        // Cratchit pass (#4). This reads the tree *after* the full suite's
+        // autofix (clippy/ruff --fix) has run, i.e. its final formatted shape,
+        // which is what we want to compare against the task's starting structure.
         let structure_after = codemap::build_cached(&self.toolbox.root)?.structure_signature();
         if structure_after == *structure_before {
             eprintln!("--- overview review skipped: no structural change ---");
         } else {
             self.refresh_overview(task).await;
         }
-        Ok(Some(Self::bill(st.delegations)))
+        Ok(Some(Self::bill(st.turns)))
     }
 
     /// Load .scrooge/overview.md, having Cratchit write it first if missing.
@@ -724,8 +764,8 @@ impl<C: Chat + Send + Sync> Orchestrator<C> {
     }
 
     /// Completion banner. The token/cost accounting lives in `wages_footer`.
-    fn bill(delegations: usize) -> String {
-        format!("task complete in {delegations} delegation(s).")
+    fn bill(turns: usize) -> String {
+        format!("task complete in {turns} turn(s).")
     }
 
     /// Two-line footer for `scrooge run`/`scrooge cratchit`: what this request
@@ -760,12 +800,12 @@ impl<C: Chat + Send + Sync> Orchestrator<C> {
         prev_report: Option<&str>,
         tier: CheckTier,
     ) -> Result<(String, Option<bool>)> {
-        let before = worktree_changes(&self.toolbox.root);
+        let before = worktree_fingerprint(&self.toolbox.root);
         let defs = tools::definitions();
         let mut log = self.cratchit_brief(task, instructions, prev_report, true)?;
         let mut report = clamp_report(&self.run_cratchit(&mut log, &defs).await?);
 
-        let after = worktree_changes(&self.toolbox.root);
+        let after = worktree_fingerprint(&self.toolbox.root);
         if let (Some(b), Some(a)) = (&before, &after)
             && b == a
         {
@@ -1129,7 +1169,7 @@ mod tests {
             toolbox: Toolbox::new(root),
             cheap_model: "fake-cheap".into(),
             sota_model: "fake-sota".into(),
-            max_steps: 20,
+            max_turns: 20,
         }
     }
 
@@ -1149,6 +1189,43 @@ mod tests {
             .status()
             .is_ok_and(|s| s.success());
         assert!(ok, "git init failed in test setup");
+    }
+
+    /// Stage everything and commit, with an inline identity so the test doesn't
+    /// depend on the machine's git config.
+    fn git_commit_all(root: &Path) {
+        let status = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        assert!(status(&["add", "-A"]), "git add failed");
+        assert!(
+            status(&[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ]),
+            "git commit failed"
+        );
+    }
+
+    /// Write a `.scrooge/checks.toml` with a single synthetic language whose
+    /// commands are plain shell, so checks pass/fail deterministically without a
+    /// real toolchain.
+    fn seed_checks(root: &Path, quick: &str, test: &str) {
+        std::fs::write(
+            root.join(".scrooge").join("checks.toml"),
+            format!("[synthetic]\nquick = {quick:?}\ntest = {test:?}\n"),
+        )
+        .unwrap();
     }
 
     /// Pre-seed the overview so `ensure_overview` loads it instead of spending a
@@ -1257,7 +1334,8 @@ mod tests {
             FakeChat::new(vec![Message::text("assistant", "DONE")]),
         );
         let out = orch.run_task("do nothing").await.unwrap();
-        assert!(out.contains("0 delegation"), "unexpected: {out}");
+        // One Scrooge turn (the immediate DONE), no work done.
+        assert!(out.contains("1 turn"), "unexpected: {out}");
     }
 
     /// One delegation, then DONE: the delegation is counted, Cratchit's text
@@ -1277,7 +1355,8 @@ mod tests {
             ]),
         );
         let out = orch.run_task("inspect foo").await.unwrap();
-        assert!(out.contains("1 delegation"), "unexpected: {out}");
+        // Two Scrooge turns: the delegation, then the DONE.
+        assert!(out.contains("2 turn"), "unexpected: {out}");
     }
 
     /// The code-changing entry points refuse a non-git root rather than silently
@@ -1312,7 +1391,6 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("only one delegate"), "unexpected: {out}");
-        assert_eq!(st.delegations, 0);
     }
 
     /// An empty/unrepairable `instructions` is bounced without burning a
@@ -1341,7 +1419,6 @@ mod tests {
             !delegated,
             "a bounced call must not consume the turn's delegation"
         );
-        assert_eq!(st.delegations, 0);
     }
 
     /// `web_answer` is refused once the per-task budget is spent — and the refusal
@@ -1369,5 +1446,213 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("budget exhausted"), "unexpected: {out}");
+    }
+
+    fn write_file_call(id: &str, path: &str, content: &str) -> Message {
+        tool_call_msg(
+            id,
+            "write_file",
+            &format!(
+                "{{\"path\": {}, \"content\": {}}}",
+                serde_json::json!(path),
+                serde_json::json!(content)
+            ),
+        )
+    }
+
+    /// A code-changing dispatch whose quick check fails: the failure is routed
+    /// back to Cratchit `CHECK_RETRIES` times, then reported to Scrooge as a
+    /// FAILING verdict rather than spinning forever.
+    #[tokio::test]
+    async fn execute_and_verify_escalates_after_check_retries() {
+        let root = fresh_root("checkretry");
+        git_init(&root);
+        seed_overview(&root);
+        seed_checks(&root, "exit 1", "exit 1");
+        // Reply 1+2: Cratchit writes a file then reports. Replies 3+4: the two
+        // retries (the quick check fails every time, so it never goes green).
+        let mut orch = build_orchestrator(
+            root,
+            FakeChat::new(vec![
+                write_file_call("w", "f.txt", "x"),
+                Message::text("assistant", "wrote f.txt"),
+                Message::text("assistant", "still failing 1"),
+                Message::text("assistant", "still failing 2"),
+            ]),
+        );
+        let (report, verdict) = orch
+            .execute_and_verify("t", "create f.txt", None, CheckTier::Quick)
+            .await
+            .unwrap();
+        assert_eq!(verdict, Some(false));
+        assert!(report.contains("CHECKS: FAILING"), "unexpected: {report}");
+    }
+
+    /// A code-changing dispatch whose quick check passes ends with a clean
+    /// verdict on the first attempt — no retry loop.
+    #[tokio::test]
+    async fn execute_and_verify_reports_clean_when_check_passes() {
+        let root = fresh_root("checkclean");
+        git_init(&root);
+        seed_overview(&root);
+        seed_checks(&root, "true", "true");
+        let mut orch = build_orchestrator(
+            root,
+            FakeChat::new(vec![
+                write_file_call("w", "f.txt", "x"),
+                Message::text("assistant", "wrote f.txt"),
+            ]),
+        );
+        let (report, verdict) = orch
+            .execute_and_verify("t", "create f.txt", None, CheckTier::Quick)
+            .await
+            .unwrap();
+        assert_eq!(verdict, Some(true));
+        assert!(report.contains("CHECKS: clean"), "unexpected: {report}");
+    }
+
+    /// A read-only dispatch (Cratchit changes nothing on disk) returns his
+    /// findings with no CHECKS line and a None verdict — the checks are skipped.
+    #[tokio::test]
+    async fn execute_and_verify_skips_checks_when_nothing_changed() {
+        let root = fresh_root("nochange");
+        git_init(&root);
+        seed_overview(&root);
+        seed_checks(&root, "exit 1", "exit 1"); // would fail if it ever ran
+        let mut orch = build_orchestrator(
+            root,
+            FakeChat::new(vec![Message::text(
+                "assistant",
+                "investigated; nothing to change",
+            )]),
+        );
+        let (report, verdict) = orch
+            .execute_and_verify("t", "just look", None, CheckTier::Quick)
+            .await
+            .unwrap();
+        assert_eq!(verdict, None);
+        assert!(!report.contains("CHECKS"), "unexpected: {report}");
+    }
+
+    /// `try_finish` keeps nudging Scrooge to fix red checks until the attempt
+    /// budget is spent, then gives up rather than looping.
+    #[tokio::test]
+    async fn try_finish_nudges_then_gives_up_on_red_checks() {
+        let root = fresh_root("finishred");
+        git_init(&root);
+        let mut orch = build_orchestrator(root, FakeChat::new(vec![]));
+        let structure_before: Vec<String> = vec![];
+
+        // First call (attempts remaining): nudge, don't finish.
+        let mut log = Vec::new();
+        let mut st = RunState {
+            dirty: true,
+            checks_clean: Some(false),
+            finish_attempts: 0,
+            ..RunState::default()
+        };
+        let out = orch
+            .try_finish("t", &mut log, &mut st, &structure_before)
+            .await
+            .unwrap();
+        assert!(out.is_none(), "should not finish while checks are red");
+        assert_eq!(st.finish_attempts, 1);
+        assert_eq!(
+            log.last().and_then(|m| m.content.as_deref()),
+            Some(SCROOGE_DONE_WITH_FAILURES)
+        );
+
+        // Last call (budget spent): give up with a terminal message.
+        st.finish_attempts = MAX_FINISH_ATTEMPTS;
+        let out = orch
+            .try_finish("t", &mut log, &mut st, &structure_before)
+            .await
+            .unwrap();
+        assert_eq!(
+            out.as_deref(),
+            Some("checks still failing; review the output above")
+        );
+    }
+
+    /// With nothing changed, `try_finish` accepts completion immediately without
+    /// running any checks.
+    #[tokio::test]
+    async fn try_finish_accepts_when_not_dirty() {
+        let root = fresh_root("finishclean");
+        git_init(&root);
+        let mut orch = build_orchestrator(root, FakeChat::new(vec![]));
+        let mut log = Vec::new();
+        let mut st = RunState::default(); // dirty: false
+        let out = orch.try_finish("t", &mut log, &mut st, &[]).await.unwrap();
+        assert!(
+            out.unwrap().contains("turn"),
+            "expected a completion banner"
+        );
+    }
+
+    /// The full suite gates DONE: green quick checks plus a passing full suite
+    /// accept completion (structure unchanged here, so no overview pass).
+    #[tokio::test]
+    async fn try_finish_accepts_when_full_suite_clean() {
+        let root = fresh_root("finishfull");
+        git_init(&root);
+        seed_overview(&root);
+        seed_checks(&root, "true", "true");
+        let structure_before = codemap::build_cached(&root).unwrap().structure_signature();
+        let mut orch = build_orchestrator(root, FakeChat::new(vec![]));
+        let mut log = Vec::new();
+        let mut st = RunState {
+            dirty: true,
+            checks_clean: Some(true),
+            ..RunState::default()
+        };
+        let out = orch
+            .try_finish("t", &mut log, &mut st, &structure_before)
+            .await
+            .unwrap();
+        assert!(
+            out.unwrap().contains("turn"),
+            "expected a completion banner"
+        );
+    }
+
+    /// Two edits with an identical `git diff --stat` (one changed line each)
+    /// still yield distinct fingerprints — the bug the hash fixes — and a revert
+    /// reproduces the clean fingerprint exactly.
+    #[test]
+    fn worktree_fingerprint_distinguishes_same_stat_edits() {
+        let root = fresh_root("fingerprint");
+        git_init(&root);
+        std::fs::write(root.join("a.txt"), "a\nb\nc\n").unwrap();
+        git_commit_all(&root);
+        let clean = worktree_fingerprint(&root);
+        assert!(clean.is_some(), "fingerprint needs a git repo");
+
+        std::fs::write(root.join("a.txt"), "X\nb\nc\n").unwrap();
+        let fp1 = worktree_fingerprint(&root);
+        std::fs::write(root.join("a.txt"), "Y\nb\nc\n").unwrap();
+        let fp2 = worktree_fingerprint(&root);
+
+        assert_ne!(clean, fp1, "an edit must change the fingerprint");
+        assert_ne!(fp1, fp2, "same-stat edits must still differ");
+
+        std::fs::write(root.join("a.txt"), "a\nb\nc\n").unwrap();
+        assert_eq!(worktree_fingerprint(&root), clean, "revert restores it");
+    }
+
+    #[test]
+    fn close_truncated_json_balances_open_structures() {
+        // Open string is closed.
+        assert_eq!(close_truncated_json(r#"{"a": "hello"#), r#"{"a": "hello"}"#);
+        // Nested array+object are closed in reverse.
+        assert_eq!(close_truncated_json(r#"{"a": [1, 2"#), r#"{"a": [1, 2]}"#);
+        // A dangling separator between elements is dropped.
+        assert_eq!(close_truncated_json(r#"{"a": 1,"#), r#"{"a": 1}"#);
+        // A trailing escape can't be allowed to escape our closing quote.
+        assert_eq!(close_truncated_json(r#"{"a": "x\"#), r#"{"a": "x"}"#);
+        // An already-closed string inside an open object.
+        assert_eq!(close_truncated_json(r#"{"a": "x""#), r#"{"a": "x"}"#);
+        // The repaired output always parses.
+        assert!(serde_json::from_str::<Value>(&close_truncated_json(r#"{"a": [{"b": "c"#)).is_ok());
     }
 }

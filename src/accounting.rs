@@ -126,14 +126,18 @@ pub fn record(
         entry[key] = json!(entry[key].as_u64().unwrap_or(0) + add);
     }
     entry["cost_usd"] = json!(entry["cost_usd"].as_f64().unwrap_or(0.0) + cost_usd);
-    // What these tokens would have cost on the Scrooge model (rates from
-    // .scrooge/rates.toml) less what they actually cost — the thrift of
-    // delegating to Cratchit, in plain USD.
-    let rates = load_rates(&dir);
-    let p = entry["prompt_tokens"].as_u64().unwrap_or(0) as f64;
-    let c = entry["completion_tokens"].as_u64().unwrap_or(0) as f64;
-    let saved = scrooge_cost(&rates, p, c) - entry["cost_usd"].as_f64().unwrap_or(0.0);
-    entry["shillings_saved"] = json!(saved);
+    // Shillings saved is the thrift of running Cratchit instead of Scrooge:
+    // what these tokens would have cost on the Scrooge model (rates from
+    // .scrooge/rates.toml) less what they actually cost. Only meaningful for
+    // Cratchit — for Scrooge it would value the model against itself, so the
+    // field is left off his ledger entry entirely.
+    if agent == "cratchit" {
+        let rates = load_rates(&dir);
+        let p = entry["prompt_tokens"].as_u64().unwrap_or(0) as f64;
+        let c = entry["completion_tokens"].as_u64().unwrap_or(0) as f64;
+        let saved = scrooge_cost(&rates, p, c) - entry["cost_usd"].as_f64().unwrap_or(0.0);
+        entry["shillings_saved"] = json!(saved);
+    }
     if let Ok(s) = serde_json::to_string_pretty(&ledger) {
         let _ = std::fs::write(&path, s);
     }
@@ -175,6 +179,9 @@ mod tests {
             (ledger["cratchit"]["shillings_saved"].as_f64().unwrap() - (0.000675 - 0.003)).abs()
                 < 1e-9
         );
+        // Scrooge's entry carries no shillings_saved — valuing the model
+        // against itself is meaningless.
+        assert!(ledger["scrooge"]["shillings_saved"].is_null());
         let log = std::fs::read_to_string(scrooge_dir.join("accounts.log")).unwrap();
         assert_eq!(log.matches("=== ").count(), 3, "one header per call");
         assert!(log.contains("fix the bug"), "full request text logged");
