@@ -6,7 +6,7 @@
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::path::PathBuf;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::agents::Orchestrator;
 use crate::{codemap, helpers, practices};
@@ -93,31 +93,58 @@ impl Server {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        let stdin = BufReader::new(tokio::io::stdin());
+        let mut stdin = tokio::io::stdin();
         let mut stdout = tokio::io::stdout();
-        let mut lines = stdin.lines();
-        while let Some(line) = lines.next_line().await? {
-            if line.trim().is_empty() {
-                continue;
+        // Frame on JSON value boundaries rather than newlines: accumulate bytes
+        // and let serde's streaming deserializer pull off as many complete
+        // values as are buffered, regardless of how reads or whitespace split
+        // them. A value straddling two reads simply waits for the next chunk.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let n = stdin.read(&mut chunk).await?;
+            if n == 0 {
+                break; // EOF
             }
-            let req: Value = match serde_json::from_str(&line) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let id = req.get("id").cloned();
-            let method = req["method"].as_str().unwrap_or("");
-            // Notifications (no id) get no response.
-            let Some(id) = id else { continue };
-            let result = self.handle(method, &req["params"]).await;
-            let resp = match result {
-                Ok(r) => json!({"jsonrpc": "2.0", "id": id, "result": r}),
-                Err(e) => json!({"jsonrpc": "2.0", "id": id,
-                    "error": {"code": -32603, "message": format!("{e:#}")}}),
-            };
-            stdout.write_all(format!("{resp}\n").as_bytes()).await?;
-            stdout.flush().await?;
+            buf.extend_from_slice(&chunk[..n]);
+            let mut consumed = 0;
+            let mut stream = serde_json::Deserializer::from_slice(&buf).into_iter::<Value>();
+            loop {
+                match stream.next() {
+                    Some(Ok(req)) => {
+                        consumed = stream.byte_offset();
+                        if let Some(resp) = self.respond(&req).await {
+                            stdout.write_all(format!("{resp}\n").as_bytes()).await?;
+                            stdout.flush().await?;
+                        }
+                    }
+                    // Incomplete trailing value: keep it buffered for more bytes.
+                    Some(Err(e)) if e.is_eof() => break,
+                    // Malformed value: drop what's buffered and resync on the
+                    // next read rather than spinning on the same bad bytes.
+                    Some(Err(_)) => {
+                        consumed = buf.len();
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            drop(stream);
+            buf.drain(..consumed);
         }
         Ok(())
+    }
+
+    /// Build the JSON-RPC response for one request, or `None` for a
+    /// notification (no `id`), which gets no reply.
+    async fn respond(&mut self, req: &Value) -> Option<Value> {
+        let id = req.get("id").cloned()?;
+        let method = req["method"].as_str().unwrap_or("");
+        Some(match self.handle(method, &req["params"]).await {
+            Ok(r) => json!({"jsonrpc": "2.0", "id": id, "result": r}),
+            Err(e) => json!({"jsonrpc": "2.0", "id": id,
+                "error": {"code": -32603, "message": format!("{e:#}")}}),
+        })
     }
 
     async fn handle(&mut self, method: &str, params: &Value) -> Result<Value> {
