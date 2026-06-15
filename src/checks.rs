@@ -8,10 +8,12 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt::Write;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::codemap;
+use crate::util;
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct LangChecks {
@@ -154,11 +156,29 @@ pub fn load(root: &Path) -> Result<BTreeMap<String, LangChecks>> {
 }
 
 fn run_cmd(root: &Path, cmd: &str) -> (bool, String) {
-    let out = Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .current_dir(root)
-        .output();
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(cmd).current_dir(root);
+    // If the project has a venv, put its bin first on PATH so `python`/`pytest`
+    // resolve to it and can import packages `add_dependency` installed there
+    // (it targets `.venv`). Done here, at run time, so it holds regardless of
+    // when checks.toml was seeded; harmless for non-python projects, which have
+    // no `.venv`. Tools missing from the venv still fall back to ambient PATH.
+    let venv_bin = root.join(".venv").join("bin");
+    if venv_bin.is_dir() {
+        let path = std::env::var("PATH").unwrap_or_default();
+        command.env("PATH", format!("{}:{path}", venv_bin.display()));
+    }
+    // Confine the check command the same way Cratchit's `shell` tool is: these
+    // run test code and lint autofixes (often just-written, untrusted), so they
+    // get the same read-anywhere / write-under-root Landlock policy.
+    let sandbox_root = root.to_path_buf();
+    unsafe {
+        command.pre_exec(move || {
+            let _ = crate::sandbox::confine(&sandbox_root);
+            Ok(())
+        });
+    }
+    let out = command.output();
     match out {
         Ok(o) => {
             let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
@@ -167,22 +187,6 @@ fn run_cmd(root: &Path, cmd: &str) -> (bool, String) {
         }
         Err(e) => (false, format!("failed to spawn `{cmd}`: {e}")),
     }
-}
-
-/// Keep the tail (where test failures and error summaries end up).
-fn truncate(s: &str) -> String {
-    let s = s.trim();
-    if s.len() <= MAX_OUTPUT_CHARS {
-        return s.to_string();
-    }
-    // Back off to a char boundary: tool output is full of multibyte
-    // punctuation (rustc’s quotes, arrows) and a mid-char slice panics.
-    let mut start = s.len() - MAX_OUTPUT_CHARS;
-    while !s.is_char_boundary(start) {
-        start -= 1;
-    }
-    let start = s[start..].find('\n').map_or(start, |i| start + i + 1);
-    format!("[... truncated ...]\n{}", &s[start..])
 }
 
 /// Fast per-step verification for the agent loop: format, then each language's
@@ -202,7 +206,9 @@ pub fn run_quick(root: &Path) -> Result<Report> {
         if let Some(cmd) = &checks.quick {
             let (ok, out) = run_cmd(root, cmd);
             if !ok {
-                report.errors.push((lang.clone(), truncate(&out)));
+                report
+                    .errors
+                    .push((lang.clone(), util::tail(&out, MAX_OUTPUT_CHARS)));
             }
         }
     }
@@ -244,7 +250,9 @@ pub fn run(root: &Path) -> Result<Report> {
         if let Some(cmd) = &checks.test {
             let (ok, out) = run_cmd(root, cmd);
             if !ok {
-                report.errors.push((lang.clone(), truncate(&out)));
+                report
+                    .errors
+                    .push((lang.clone(), util::tail(&out, MAX_OUTPUT_CHARS)));
             }
         }
     }
@@ -258,7 +266,9 @@ pub fn run(root: &Path) -> Result<Report> {
         if let Some(cmd) = &checks.lint {
             let (ok, out) = run_cmd(root, cmd);
             if !ok {
-                report.warnings.push((lang.clone(), truncate(&out)));
+                report
+                    .warnings
+                    .push((lang.clone(), util::tail(&out, MAX_OUTPUT_CHARS)));
             }
         }
     }

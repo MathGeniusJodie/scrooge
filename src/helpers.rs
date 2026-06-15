@@ -225,13 +225,13 @@ fn rust_deps(root: &Path) -> Result<Vec<(String, PathBuf)>> {
 /// otherwise the interpreter's site-packages.
 fn python_deps(root: &Path) -> Vec<(String, PathBuf)> {
     let mut site_dirs: Vec<PathBuf> = Vec::new();
-    for venv in ["venv", ".venv"] {
-        if let Ok(entries) = std::fs::read_dir(root.join(venv).join("lib")) {
-            for e in entries.flatten() {
-                let sp = e.path().join("site-packages");
-                if sp.is_dir() {
-                    site_dirs.push(sp);
-                }
+    // `.venv` is the one venv convention scrooge uses — `add_dependency`
+    // creates it there, so that is the only project venv we scan.
+    if let Ok(entries) = std::fs::read_dir(root.join(".venv").join("lib")) {
+        for e in entries.flatten() {
+            let sp = e.path().join("site-packages");
+            if sp.is_dir() {
+                site_dirs.push(sp);
             }
         }
     }

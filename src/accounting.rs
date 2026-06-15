@@ -67,6 +67,14 @@ fn prompt_text(request: &Value) -> String {
     out
 }
 
+/// What `prompt`/`completion` tokens would have cost on the Scrooge model at
+/// the given rates. The single source of truth for the "shillings saved" math,
+/// shared by `record` (cumulative totals) and `shillings_saved` (per-request).
+#[allow(clippy::cast_precision_loss)]
+fn scrooge_cost(rates: &Rates, prompt: f64, completion: f64) -> f64 {
+    prompt * rates.scrooge_usd_per_mtok_in / 1e6 + completion * rates.scrooge_usd_per_mtok_out / 1e6
+}
+
 /// The model's text output, ignoring any tool calls it requested.
 fn output_text(response: &Value) -> String {
     response["choices"][0]["message"]["content"]
@@ -124,9 +132,8 @@ pub fn record(
     let rates = load_rates(&dir);
     let p = entry["prompt_tokens"].as_u64().unwrap_or(0) as f64;
     let c = entry["completion_tokens"].as_u64().unwrap_or(0) as f64;
-    let scrooge_cost =
-        p * rates.scrooge_usd_per_mtok_in / 1e6 + c * rates.scrooge_usd_per_mtok_out / 1e6;
-    entry["shillings_saved"] = json!(scrooge_cost - entry["cost_usd"].as_f64().unwrap_or(0.0));
+    let saved = scrooge_cost(&rates, p, c) - entry["cost_usd"].as_f64().unwrap_or(0.0);
+    entry["shillings_saved"] = json!(saved);
     if let Ok(s) = serde_json::to_string_pretty(&ledger) {
         let _ = std::fs::write(&path, s);
     }
@@ -139,9 +146,7 @@ pub fn record(
 #[allow(clippy::cast_precision_loss)]
 pub fn shillings_saved(root: &Path, prompt: u64, completion: u64, cost_usd: f64) -> f64 {
     let rates = load_rates(&root.join(".scrooge"));
-    let scrooge_cost = prompt as f64 * rates.scrooge_usd_per_mtok_in / 1e6
-        + completion as f64 * rates.scrooge_usd_per_mtok_out / 1e6;
-    scrooge_cost - cost_usd
+    scrooge_cost(&rates, prompt as f64, completion as f64) - cost_usd
 }
 
 #[cfg(test)]

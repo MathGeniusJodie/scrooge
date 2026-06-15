@@ -7,7 +7,9 @@ mod mcp;
 mod openrouter;
 mod overview;
 mod practices;
+mod sandbox;
 mod tools;
+mod util;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

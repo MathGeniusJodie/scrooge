@@ -233,15 +233,6 @@ const MAX_REPORT_CHARS: usize = 1200;
 /// minimal so a clean step costs one line and a red one a short tail.
 const MAX_FAIL_CHARS: usize = 400;
 
-/// Largest char boundary <= `i`, so byte-budget truncation never panics on
-/// multibyte UTF-8 (reports and check output routinely contain `—`, `’`, …).
-const fn floor_char_boundary(s: &str, mut i: usize) -> usize {
-    while !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
-
 /// Clamp a Cratchit report to the size rule 7 promises.
 fn clamp_report(s: &str) -> String {
     let mut out = s
@@ -250,7 +241,7 @@ fn clamp_report(s: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     if out.len() > MAX_REPORT_CHARS {
-        out.truncate(floor_char_boundary(&out, MAX_REPORT_CHARS));
+        out.truncate(crate::util::floor_char_boundary(&out, MAX_REPORT_CHARS));
         out.push_str("\n[report clamped]");
     } else if s.lines().count() > MAX_REPORT_LINES {
         out.push_str("\n[report clamped]");
@@ -267,24 +258,35 @@ fn arg_preview(args: &str) -> String {
     }
     format!(
         "{}… [{} chars]",
-        &args[..floor_char_boundary(args, MAX)],
+        &args[..crate::util::floor_char_boundary(args, MAX)],
         args.len()
     )
 }
 
-/// Keep the tail of `s` (failure summaries end up at the bottom).
-fn tail(s: &str, max_chars: usize) -> String {
-    let s = s.trim();
-    if s.len() <= max_chars {
-        return s.to_string();
+/// Verify the project root is a git work tree, bailing with actionable guidance
+/// if not. The agent loop uses `worktree_changes` to tell whether a step
+/// changed code (and therefore whether checks must run / a CHECKS verdict is
+/// owed); without git that detection silently degrades, so the code-changing
+/// entry points require it up front rather than misbehaving later.
+fn require_git_repo(root: &Path) -> Result<()> {
+    let inside = std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(root)
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !inside {
+        anyhow::bail!(
+            "{} is not a git repository (or git is unavailable). Scrooge needs git to \
+             detect what each step changed — run `git init` here first.",
+            root.display()
+        );
     }
-    let cut = floor_char_boundary(s, s.len() - max_chars);
-    let cut = s[cut..].find('\n').map_or(cut, |i| cut + i + 1);
-    format!("[...]\n{}", &s[cut..])
+    Ok(())
 }
 
 /// Worktree state as git sees it: diffstat of tracked changes plus untracked
-/// files. None when the root is not a git repo (or git is unavailable).
+/// files. None when the root is not a git repo (or git is unavailable);
+/// the code-changing entry points guard against that with `require_git_repo`.
 fn worktree_changes(root: &Path) -> Option<String> {
     let git = |args: &[&str]| {
         std::process::Command::new("git")
@@ -420,6 +422,7 @@ impl<C: Chat + Send + Sync> Orchestrator<C> {
     /// Scrooge turn, which also eliminates the stale-context re-injection
     /// problem of the old round-based loop.
     pub async fn run_task(&mut self, task: &str) -> Result<String> {
+        require_git_repo(&self.toolbox.root)?;
         let overview = self.ensure_overview(task).await?;
         let map = codemap::build_cached(&self.toolbox.root)?;
         // Snapshot the structure now so completion can tell whether the task
@@ -609,7 +612,7 @@ impl<C: Chat + Send + Sync> Orchestrator<C> {
             if st.finish_attempts < MAX_FINISH_ATTEMPTS {
                 st.finish_attempts += 1;
                 st.checks_clean = Some(false);
-                let failures = tail(&checks::render(&full), MAX_FAIL_CHARS);
+                let failures = crate::util::tail(&checks::render(&full), MAX_FAIL_CHARS);
                 log.push(Message::text(
                     "user",
                     FINISH_BLOCKED.replace("{FAILURES}", &failures),
@@ -804,7 +807,7 @@ impl<C: Chat + Send + Sync> Orchestrator<C> {
             write!(
                 report,
                 "\nCHECKS: FAILING\n{}",
-                tail(&failures, MAX_FAIL_CHARS)
+                crate::util::tail(&failures, MAX_FAIL_CHARS)
             )
             .unwrap();
         }
@@ -826,6 +829,7 @@ impl<C: Chat + Send + Sync> Orchestrator<C> {
     /// token bill for this call only (usage accumulates across the server's
     /// lifetime).
     pub async fn delegate(&mut self, task: &str, instructions: &str) -> Result<String> {
+        require_git_repo(&self.toolbox.root)?;
         // Same rule as the native loop: an overview exists before any work
         // is planned against the codebase.
         self.ensure_overview(task).await?;
@@ -1116,6 +1120,10 @@ mod tests {
     fn orchestrator(client: FakeChat) -> Orchestrator<FakeChat> {
         let root = std::env::temp_dir().join(format!("scrooge-fake-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
+        build_orchestrator(root, client)
+    }
+
+    fn build_orchestrator(root: PathBuf, client: FakeChat) -> Orchestrator<FakeChat> {
         Orchestrator {
             client,
             toolbox: Toolbox::new(root),
@@ -1123,6 +1131,38 @@ mod tests {
             sota_model: "fake-sota".into(),
             max_steps: 20,
         }
+    }
+
+    /// A clean, per-test temp directory (unique by test tag) with a `.scrooge`
+    /// dir ready. Not a git repo — call `git_init` when the flow needs one.
+    fn fresh_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("scrooge-test-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".scrooge")).unwrap();
+        root
+    }
+
+    fn git_init(root: &Path) {
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(ok, "git init failed in test setup");
+    }
+
+    /// Pre-seed the overview so `ensure_overview` loads it instead of spending a
+    /// (scripted) model call to write one.
+    fn seed_overview(root: &Path) {
+        std::fs::write(root.join(".scrooge").join("overview.md"), "A test project.").unwrap();
+    }
+
+    fn delegate_call(id: &str, instructions: &str) -> Message {
+        tool_call_msg(
+            id,
+            "delegate_to_cratchit",
+            &format!("{{\"instructions\": {}}}", serde_json::json!(instructions)),
+        )
     }
 
     /// The shared Cratchit loop dispatches a scripted tool call against the real
@@ -1188,5 +1228,146 @@ mod tests {
         // Without the truncation signal, broken JSON is NOT repaired — a genuine
         // malformed call returns Null instead of a guessed (partial) value.
         assert!(parse_tool_args(r#"{"instructions": "edit foo.rs and rename"#, false).is_null());
+    }
+
+    #[test]
+    fn clamp_report_caps_lines_and_marks_truncation() {
+        let many = (0..30)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = clamp_report(&many);
+        assert!(out.contains("[report clamped]"));
+        // The capped body keeps MAX_REPORT_LINES, plus the one marker line.
+        assert_eq!(out.lines().count(), MAX_REPORT_LINES + 1);
+        // A short report passes through untouched.
+        assert_eq!(clamp_report("a\nb"), "a\nb");
+    }
+
+    /// The full planning loop, driven entirely by scripted replies: Scrooge ends
+    /// his turn with no tool call and, since nothing was changed on disk, the run
+    /// finishes immediately without a single check ever running.
+    #[tokio::test]
+    async fn run_task_finishes_when_nothing_changed() {
+        let root = fresh_root("noop");
+        git_init(&root);
+        seed_overview(&root);
+        let mut orch = build_orchestrator(
+            root,
+            FakeChat::new(vec![Message::text("assistant", "DONE")]),
+        );
+        let out = orch.run_task("do nothing").await.unwrap();
+        assert!(out.contains("0 delegation"), "unexpected: {out}");
+    }
+
+    /// One delegation, then DONE: the delegation is counted, Cratchit's text
+    /// report flows back (he changed nothing, so no CHECKS verdict is owed), and
+    /// the loop accepts completion.
+    #[tokio::test]
+    async fn run_task_runs_one_delegation_then_finishes() {
+        let root = fresh_root("delegate");
+        git_init(&root);
+        seed_overview(&root);
+        let mut orch = build_orchestrator(
+            root,
+            FakeChat::new(vec![
+                delegate_call("d1", "investigate foo, change nothing"),
+                Message::text("assistant", "looked at foo; nothing to change"),
+                Message::text("assistant", "DONE"),
+            ]),
+        );
+        let out = orch.run_task("inspect foo").await.unwrap();
+        assert!(out.contains("1 delegation"), "unexpected: {out}");
+    }
+
+    /// The code-changing entry points refuse a non-git root rather than silently
+    /// losing their change-detection (and the read-only/CHECKS contract with it).
+    #[tokio::test]
+    async fn run_task_requires_a_git_repo() {
+        let root = fresh_root("nogit");
+        let mut orch = build_orchestrator(root, FakeChat::new(vec![]));
+        let err = orch.run_task("anything").await.unwrap_err();
+        assert!(format!("{err:#}").contains("git"), "unexpected: {err:#}");
+    }
+
+    /// Scrooge gets at most one delegation per turn: a second call in the same
+    /// turn is rejected and does not advance the step counter.
+    #[tokio::test]
+    async fn second_delegation_in_one_turn_is_rejected() {
+        let root = fresh_root("oneper");
+        git_init(&root);
+        let mut orch = build_orchestrator(root, FakeChat::new(vec![]));
+        let mut st = RunState::default();
+        let mut delegated = true; // pretend a delegation already happened this turn
+        let call = ToolCall {
+            id: "x".into(),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: "delegate_to_cratchit".into(),
+                arguments: r#"{"instructions": "do x"}"#.into(),
+            },
+        };
+        let out = orch
+            .run_scrooge_call("task", &call, false, &mut delegated, &mut st)
+            .await
+            .unwrap();
+        assert!(out.contains("only one delegate"), "unexpected: {out}");
+        assert_eq!(st.delegations, 0);
+    }
+
+    /// An empty/unrepairable `instructions` is bounced without burning a
+    /// delegation or briefing Cratchit with nothing.
+    #[tokio::test]
+    async fn empty_instructions_are_bounced() {
+        let root = fresh_root("empty");
+        git_init(&root);
+        let mut orch = build_orchestrator(root, FakeChat::new(vec![]));
+        let mut st = RunState::default();
+        let mut delegated = false;
+        let call = ToolCall {
+            id: "x".into(),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: "delegate_to_cratchit".into(),
+                arguments: r#"{"instructions": "   "}"#.into(),
+            },
+        };
+        let out = orch
+            .run_scrooge_call("task", &call, false, &mut delegated, &mut st)
+            .await
+            .unwrap();
+        assert!(out.contains("non-empty"), "unexpected: {out}");
+        assert!(
+            !delegated,
+            "a bounced call must not consume the turn's delegation"
+        );
+        assert_eq!(st.delegations, 0);
+    }
+
+    /// `web_answer` is refused once the per-task budget is spent — and the refusal
+    /// is decided locally, without dispatching to the toolbox (no network).
+    #[tokio::test]
+    async fn web_answer_budget_is_enforced() {
+        let root = fresh_root("web");
+        git_init(&root);
+        let mut orch = build_orchestrator(root, FakeChat::new(vec![]));
+        let mut st = RunState {
+            web_calls: SCROOGE_WEB_LOOKUPS,
+            ..RunState::default()
+        };
+        let mut delegated = false;
+        let call = ToolCall {
+            id: "w".into(),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: "web_answer".into(),
+                arguments: r#"{"query": "anything"}"#.into(),
+            },
+        };
+        let out = orch
+            .run_scrooge_call("task", &call, false, &mut delegated, &mut st)
+            .await
+            .unwrap();
+        assert!(out.contains("budget exhausted"), "unexpected: {out}");
     }
 }

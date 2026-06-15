@@ -153,7 +153,7 @@ impl Server {
     }
 
     async fn call_tool(&mut self, name: &str, args: &Value) -> Result<String> {
-        let s = |k: &str| args[k].as_str().unwrap_or("").to_string();
+        let s = |k: &str| crate::util::str_arg(args, k);
         match name {
             "get_brief" => {
                 let map = codemap::build_cached(&self.root)?;

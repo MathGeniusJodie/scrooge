@@ -163,8 +163,10 @@ fn cache_key(root: &Path) -> (SystemTime, usize) {
 pub fn build_cached(root: &Path) -> Result<Arc<CodeMap>> {
     let (mtime, count) = cache_key(root);
     let cache = CACHE.get_or_init(|| Mutex::new(None));
+    // Fast path: return the cached map if it is still current. The lock is held
+    // only for this cheap comparison.
     {
-        let mut guard = cache.lock().unwrap();
+        let guard = cache.lock().unwrap();
         if let Some(v) = guard.as_ref()
             && v.0 == root
             && v.1 == mtime
@@ -172,11 +174,13 @@ pub fn build_cached(root: &Path) -> Result<Arc<CodeMap>> {
         {
             return Ok(v.3.clone());
         }
-        let map = Arc::new(build(root)?);
-        *guard = Some((root.to_path_buf(), mtime, count, map.clone()));
-        drop(guard);
-        Ok(map)
     }
+    // Build with the lock released — tree-sitter parsing the whole tree is
+    // expensive and must not serialize every other lookup behind it (a
+    // concurrent caller may redundantly build, but the result is the same).
+    let map = Arc::new(build(root)?);
+    *cache.lock().unwrap() = Some((root.to_path_buf(), mtime, count, map.clone()));
+    Ok(map)
 }
 
 /// Line of the first syntax error in `src` per the file's grammar, or None

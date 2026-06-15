@@ -257,14 +257,8 @@ fn truncate(s: String, max: usize) -> String {
         return s;
     }
     let head = max / 4;
-    let mut head_end = head;
-    while !s.is_char_boundary(head_end) {
-        head_end -= 1;
-    }
-    let mut tail_start = s.len() - (max - head);
-    while !s.is_char_boundary(tail_start) {
-        tail_start += 1;
-    }
+    let head_end = crate::util::floor_char_boundary(&s, head);
+    let tail_start = crate::util::ceil_char_boundary(&s, s.len() - (max - head));
     format!(
         "{}\n[... {} chars truncated ...]\n{}",
         &s[..head_end],
@@ -366,7 +360,7 @@ impl Toolbox {
     }
 
     async fn dispatch(&self, name: &str, args: &Value) -> Result<String> {
-        let s = |k: &str| args[k].as_str().unwrap_or("").to_string();
+        let s = |k: &str| crate::util::str_arg(args, k);
         match name {
             "read_file" => {
                 let path = self.resolve(&s("path"));
@@ -661,7 +655,7 @@ impl Toolbox {
         // kernel without Landlock the command still runs.
         unsafe {
             cmd.pre_exec(move || {
-                let _ = sandbox::confine(&sandbox_root);
+                let _ = crate::sandbox::confine(&sandbox_root);
                 Ok(())
             });
         }
@@ -754,34 +748,6 @@ impl Toolbox {
             }
             _ => anyhow::bail!("unsupported lang {lang}"),
         }
-    }
-}
-
-mod sandbox {
-    use landlock::{
-        ABI, Access, AccessFs, Ruleset, RulesetAttr, RulesetCreatedAttr, path_beneath_rules,
-    };
-    use std::path::{Path, PathBuf};
-
-    /// Landlock policy: read the whole filesystem, write only beneath the
-    /// project root, /tmp, /dev (null, shm, …) and the package-manager
-    /// caches that `cargo`/`npm`/`pip` need to function.
-    pub fn confine(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
-        let abi = ABI::V2;
-        let mut writable: Vec<PathBuf> = vec![root.to_path_buf(), "/tmp".into(), "/dev".into()];
-        if let Ok(home) = std::env::var("HOME") {
-            for d in [".cargo", ".npm", ".cache"] {
-                writable.push(Path::new(&home).join(d));
-            }
-        }
-        writable.retain(|p| p.exists());
-        Ruleset::default()
-            .handle_access(AccessFs::from_all(abi))?
-            .create()?
-            .add_rules(path_beneath_rules(["/"], AccessFs::from_read(abi)))?
-            .add_rules(path_beneath_rules(&writable, AccessFs::from_all(abi)))?
-            .restrict_self()?;
-        Ok(())
     }
 }
 
@@ -931,10 +897,7 @@ async fn rust_doc(query: &str) -> Result<String> {
     // Skip the nav boilerplate: start at the item name, then take a window.
     let needle = query.rsplit("::").next().unwrap_or(query);
     let start = text.find(needle).unwrap_or(0);
-    let mut end = (start + 4000).min(text.len());
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = crate::util::floor_char_boundary(&text, (start + 4000).min(text.len()));
     Ok(text[start..end].to_string())
 }
 
