@@ -153,18 +153,39 @@ pub fn definitions() -> Vec<Value> {
     ]
 }
 
-/// Scrooge's single tool. Unlike Cratchit he never touches files or the shell;
-/// his only reach beyond the brief is one cheap "web answer" to settle library
-/// or API questions before committing to a plan.
+/// Scrooge's tools. `delegate_to_cratchit` is the primary workhorse;
+/// `web_answer` is withheld after `SCROOGE_WEB_LOOKUPS` uses.
 pub fn scrooge_definitions() -> Vec<Value> {
-    vec![tool(
-        "web_answer",
-        "Get one concise AI-summarized answer from the web (Brave summarizer, not a link list). Use SPARINGLY — only to settle a library/dependency choice or a specific API/implementation detail you are unsure of before planning. Not for code in this repo (you already have the brief).",
-        &obj(
-            &json!({"query": {"type": "string", "description": "a focused question, e.g. 'best maintained rust crate for TOML parsing 2026' or 'does tokio::fs::read_to_string exist'"}}),
-            &["query"],
+    vec![
+        tool(
+            "delegate_to_cratchit",
+            "Dispatch one step to Cratchit for execution. Cratchit has full tool access \
+             (files, shell, python, wolfram, docs, call graph). Instructions must be \
+             standalone and imperative, naming exact files/symbols. Returns a report \
+             with CHANGED and CHECKS lines — trust those over Cratchit's claims. \
+             Call ONCE per turn; wait for the report before issuing the next step.",
+            &obj(
+                &json!({"instructions": {"type": "string", "description": "standalone imperative step for Cratchit to execute and verify"}}),
+                &["instructions"],
+            ),
         ),
-    )]
+        tool(
+            "web_answer",
+            "Get one concise AI-summarized answer from the web (Brave summarizer, not a link list). Use SPARINGLY — only to settle a library/dependency choice or a specific API/implementation detail you are unsure of. Not for code in this repo (you already have the brief).",
+            &obj(
+                &json!({"query": {"type": "string", "description": "a focused question, e.g. 'best maintained rust crate for TOML parsing 2026' or 'does tokio::fs::read_to_string exist'"}}),
+                &["query"],
+            ),
+        ),
+    ]
+}
+
+/// Scrooge's tool set after the web-answer budget is exhausted.
+pub fn scrooge_delegate_only() -> Vec<Value> {
+    scrooge_definitions()
+        .into_iter()
+        .filter(|d| d["function"]["name"] == "delegate_to_cratchit")
+        .collect()
 }
 
 const MAX_OUTPUT: usize = 8000;
