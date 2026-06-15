@@ -80,11 +80,12 @@ KEY GUIDANCE:\n{GUIDANCE}";
 
 /// Briefing for a fresh Cratchit. Placeholders: {ROOT} {TASK} {OVERVIEW}
 /// {PLAN} {PREV} {CONTEXT} {MAP} {GUIDANCE}.
+/// {GUIDANCE} is a self-contained block (header included) so it disappears
+/// cleanly when withheld — see `cratchit_execute_with`.
 const CRATCHIT_BRIEF: &str = "\
 PROJECT ROOT: {ROOT}\nTASK: {TASK}\n{OVERVIEW}\n\
 SCROOGE'S INSTRUCTIONS:\n{PLAN}\n{PREV}{CONTEXT}\
-CODE MAP (files mentioned in the instructions shown in full):\n{MAP}\n\
-GUIDANCE:\n{GUIDANCE}";
+CODE MAP (files mentioned in the instructions shown in full):\n{MAP}\n{GUIDANCE}";
 
 /// Injected as a user message when Scrooge stops calling tools while CHECKS
 /// is still FAILING, so it is nudged to delegate a fix rather than finish.
@@ -544,6 +545,7 @@ impl Orchestrator {
                 None,
                 None,
                 Self::context_tools(),
+                true,
             )
             .await?;
         let mut text = text.trim().to_string();
@@ -559,8 +561,17 @@ impl Orchestrator {
     /// withhold the file-writing tools (see `overview_tools`) and let the
     /// orchestrator, not Cratchit, persist the result.
     async fn cratchit_overview(&mut self, task: &str, instructions: &str) -> Result<String> {
+        // No GUIDANCE: writing prose about purpose/architecture is not coding
+        // work, so the best-practice sections are noise here.
         let text = self
-            .cratchit_execute_with(task, instructions, None, None, Self::overview_tools())
+            .cratchit_execute_with(
+                task,
+                instructions,
+                None,
+                None,
+                Self::overview_tools(),
+                false,
+            )
             .await?;
         Ok(text.trim().to_string())
     }
@@ -856,7 +867,7 @@ impl Orchestrator {
         prev_report: Option<&str>,
         context: Option<&str>,
     ) -> Result<String> {
-        self.cratchit_execute_with(task, plan, prev_report, context, tools::definitions())
+        self.cratchit_execute_with(task, plan, prev_report, context, tools::definitions(), true)
             .await
     }
 
@@ -871,6 +882,7 @@ impl Orchestrator {
         prev_report: Option<&str>,
         context: Option<&str>,
         defs: Vec<Value>,
+        include_guidance: bool,
     ) -> Result<String> {
         // Inject context deterministically instead of having the model fetch
         // it: the code map sliced to what the plan mentions, the full
@@ -879,7 +891,16 @@ impl Orchestrator {
         let slice_text = format!("{task} {plan}");
         let full_map = codemap::build_cached(&self.toolbox.root)?;
         let map = full_map.brief_for(&slice_text);
-        let guidance = practices::relevant_sections(&slice_text, &full_map.languages());
+        // Withheld for the overview passes: prose about purpose/architecture is
+        // not coding work, so the best-practice sections are just noise there.
+        let guidance = if include_guidance {
+            format!(
+                "GUIDANCE:\n{}",
+                practices::relevant_sections(&slice_text, &full_map.languages())
+            )
+        } else {
+            String::new()
+        };
         // Loaded, never generated, here — ensure_overview() itself runs
         // through cratchit_execute, so generating would recurse.
         let overview = crate::overview::load(&self.toolbox.root)
