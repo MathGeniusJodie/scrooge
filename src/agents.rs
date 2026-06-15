@@ -34,10 +34,8 @@ You never read full files and never write code. Your tools:\n\
   file contents: when you need file-level detail before you can plan a change, spend one \
   delegate_to_cratchit purely to investigate — tell Cratchit to read the relevant files and \
   report the facts, changing nothing; a read-only step returns just his findings (no CHECKS).\n\
-- symbol_info / callers / callees: free, instant call-graph lookups (a symbol's \
-  signature, who calls it, what it calls). Use them to gauge the blast radius of a change \
-  before delegating — they cost nothing, so never spend a delegation just to ask who calls \
-  what.\n\
+- symbol_info / callers / callees: call-graph lookups (a symbol's \
+  signature, who calls it, what it calls).\n\
 - web_answer: a concise AI answer from the web. Use SPARINGLY — only when a \
   library/dependency choice or a specific API detail would materially change your next \
   step and you are not sure of it. Not for code in this repo. Most tasks need zero calls.\n\
