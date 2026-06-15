@@ -84,6 +84,17 @@ pub fn definitions() -> Vec<Value> {
             ),
         ),
         tool(
+            "read_symbol",
+            "Read a whole function/method/struct's source by its code-map name — the parser supplies the exact span, so no line guessing. Prefer this over a read_file range when you want one definition. Optional path narrows when the name is ambiguous.",
+            &obj(
+                &json!({
+                    "name": {"type": "string", "description": "symbol name from the code map, e.g. 'parse' or 'Client.chat'"},
+                    "path": {"type": "string", "description": "file filter when ambiguous, optional"}
+                }),
+                &["name"],
+            ),
+        ),
+        tool(
             "replace_symbol",
             "Replace an entire function/method/struct by its code-map name with new source — prefer this over edit_file when rewriting a whole definition; no find string needed, the span comes from the parser. Returns a syntax verdict. Optional path narrows when the name is ambiguous.",
             &obj(
@@ -102,22 +113,17 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "python",
-            "Run Python code; use for ALL math, counting, logic and data transformation — never work a result out in your head. Prints stdout.",
+            "Run Python code; use for ALL math, counting, logic and data transformation — never work a result out in your head. Use sympy for symbolic math, calculus and equation solving. Prints stdout.",
             &obj(&json!({"code": {"type": "string"}}), &["code"]),
         ),
         tool(
-            "wolfram",
-            "WolframScript for symbolic math, calculus, equation solving — never work these out by hand.",
-            &obj(&json!({"expression": {"type": "string"}}), &["expression"]),
-        ),
-        tool(
             "symbol_info",
-            "Signature, location, callers and callees of a symbol. Check it before changing any signature, to see the change's blast radius.",
+            "Signature and location of a symbol. Use callers/callees for the call graph.",
             &obj(&json!({"name": {"type": "string"}}), &["name"]),
         ),
         tool(
             "callers",
-            "Functions that call the named function — check before changing its signature.",
+            "Functions that call the named function — check before changing its signature to see the change's blast radius.",
             &obj(&json!({"name": {"type": "string"}}), &["name"]),
         ),
         tool(
@@ -141,14 +147,7 @@ pub fn definitions() -> Vec<Value> {
                 &[],
             ),
         ),
-        tool(
-            "search_libraries",
-            "Web-search for the best external library for a need — use it whenever a task needs a library and none was named. Call before add_dependency",
-            &obj(
-                &json!({"query": {"type": "string", "description": "what you need, e.g. 'rust crate for parsing TOML'"}}),
-                &["query"],
-            ),
-        ),
+        web_answer_tool(),
         tool(
             "add_dependency",
             "Add a dependency at its latest published version (cargo add / pip install -U / npm install @latest). Never write version numbers from memory.",
@@ -170,7 +169,7 @@ pub fn scrooge_definitions() -> Vec<Value> {
         tool(
             "delegate_to_cratchit",
             "Dispatch one step to Cratchit for execution. Cratchit has full tool access \
-             (files, shell, python, wolfram, docs, call graph); when you need file-level \
+             (files, shell, python, docs, call graph); when you need file-level \
              facts before planning a \
              change, spend one call purely to investigate — tell him to read the relevant \
              files and report, changing nothing. Instructions must be standalone and \
@@ -183,12 +182,12 @@ pub fn scrooge_definitions() -> Vec<Value> {
         ),
         tool(
             "symbol_info",
-            "signature, location, callers and callees of a symbol. Use it to judge the blast radius of a change before delegating",
+            "signature and location of a symbol. Use callers/callees for the call graph.",
             &obj(&json!({"name": {"type": "string"}}), &["name"]),
         ),
         tool(
             "callers",
-            "the functions that call the named function.",
+            "the functions that call the named function — its blast radius before a signature change.",
             &obj(&json!({"name": {"type": "string"}}), &["name"]),
         ),
         tool(
@@ -196,15 +195,24 @@ pub fn scrooge_definitions() -> Vec<Value> {
             "the functions the named function calls.",
             &obj(&json!({"name": {"type": "string"}}), &["name"]),
         ),
-        tool(
-            "web_answer",
-            "Get one concise AI-summarized answer from the web (Brave summarizer, not a link list). Use SPARINGLY — only to settle a library/dependency choice or a specific API/implementation detail you are unsure of; most tasks need zero calls. Not for code in this repo (you already have the brief).",
-            &obj(
-                &json!({"query": {"type": "string", "description": "a focused question, e.g. 'best maintained rust crate for TOML parsing 2026' or 'does tokio::fs::read_to_string exist'"}}),
-                &["query"],
-            ),
-        ),
+        web_answer_tool(),
     ]
+}
+
+/// The single web tool, shared by Cratchit and Scrooge: one AI-summarized
+/// answer (Brave summarizer), used both to pick an external library and to
+/// settle a specific API/version detail. Identical in both tool lists so the
+/// provider's KV cache survives, and so there is one web affordance to reason
+/// about rather than a search-vs-answer split.
+fn web_answer_tool() -> Value {
+    tool(
+        "web_answer",
+        "Get one concise AI-summarized answer from the web (not a link list). Use SPARINGLY — to choose an external library for a need, or settle a specific API/version/implementation detail you are unsure of; most tasks need zero calls. Not for facts about code in this repo. Call before add_dependency when picking a library.",
+        &obj(
+            &json!({"query": {"type": "string", "description": "a focused question, e.g. 'best maintained rust crate for TOML parsing 2026' or 'does tokio::fs::read_to_string exist'"}}),
+            &["query"],
+        ),
+    )
 }
 
 const MAX_OUTPUT: usize = 8000;
@@ -448,11 +456,8 @@ impl Toolbox {
             }
             "shell" => self.run("bash", &["-c", &s("command")]).await,
             "python" => self.run("python3", &["-c", &s("code")]).await,
-            "wolfram" => {
-                self.run("wolframscript", &["-code", &s("expression")])
-                    .await
-            }
-            "symbol_info" => Ok(codemap::build_cached(&self.root)?.detail(&s("name"))),
+            "read_symbol" => self.read_symbol(&s("name"), &s("path")),
+            "symbol_info" => Ok(codemap::build_cached(&self.root)?.info(&s("name"))),
             "callers" => {
                 let m = codemap::build_cached(&self.root)?;
                 Ok(or_none(m.callers_of(&s("name")).join("\n")))
@@ -463,7 +468,6 @@ impl Toolbox {
             }
             "helpers" => crate::helpers::filtered_listing(&self.root, &s("filter")),
             "query_docs" => self.query_docs(&s("lang"), &s("query")).await,
-            "search_libraries" => web_search(&s("query")).await,
             "web_answer" => web_answer(&s("query")).await,
             "add_dependency" => {
                 let dev = args["dev"].as_bool().unwrap_or(false);
@@ -576,6 +580,36 @@ impl Toolbox {
         Ok(out)
     }
 
+    /// Read a whole definition by its code-map name: the parser supplies the
+    /// span, so the model gets exactly the symbol's source — numbered, ready to
+    /// hand back to `replace_symbol` — without guessing a line range.
+    fn read_symbol(&self, name: &str, path_filter: &str) -> Result<String> {
+        if name.is_empty() {
+            anyhow::bail!("read_symbol needs a `name`");
+        }
+        let map = codemap::build_cached(&self.root)?;
+        let sym = resolve_symbol(&map, name, path_filter)?;
+        let path = self.resolve(&sym.file.display().to_string());
+        let content = std::fs::read_to_string(&path)?;
+        let lines: Vec<&str> = content.lines().collect();
+        if sym.end_line > lines.len() || sym.line == 0 {
+            anyhow::bail!("stale span for '{name}' — file changed; retry");
+        }
+        let body = lines[sym.line - 1..sym.end_line]
+            .iter()
+            .enumerate()
+            .map(|(i, l)| format!("{}|{l}", sym.line + i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(format!(
+            "{} @ {}:{}-{}\n{body}",
+            sym.name,
+            sym.file.display(),
+            sym.line,
+            sym.end_line
+        ))
+    }
+
     /// Replace a whole definition by its code-map name: the parser supplies
     /// the byte span, so no find string is needed and no match can be
     /// ambiguous (an ambiguous *name* is reported with candidate locations).
@@ -589,25 +623,7 @@ impl Toolbox {
             anyhow::bail!("replace_symbol needs `name` and non-empty `new_source`");
         }
         let map = codemap::build_cached(&self.root)?;
-        let candidates: Vec<_> = map
-            .symbols
-            .iter()
-            .filter(|sym| sym.name == name || sym.name.ends_with(&format!(".{name}")))
-            .filter(|sym| {
-                path_filter.is_empty() || sym.file.display().to_string().contains(path_filter)
-            })
-            .collect();
-        let sym = match candidates.as_slice() {
-            [] => anyhow::bail!("no symbol named '{name}' in the code map"),
-            [one] => *one,
-            many => anyhow::bail!(
-                "'{name}' is ambiguous; pass `path` to pick one of: {}",
-                many.iter()
-                    .map(|s| format!("{}:{}", s.file.display(), s.line))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        };
+        let sym = resolve_symbol(&map, name, path_filter)?;
         let path = self.resolve_write(&sym.file.display().to_string())?;
         let content = std::fs::read_to_string(&path)?;
         let lines: Vec<&str> = content.lines().collect();
@@ -771,38 +787,34 @@ impl Toolbox {
     }
 }
 
-async fn web_search(query: &str) -> Result<String> {
-    let key = std::env::var("BRAVE_SEARCH_KEY")
-        .map_err(|_| anyhow::anyhow!("BRAVE_SEARCH_KEY is not set"))?;
-    let body: Value = http()
-        .get("https://api.search.brave.com/res/v1/web/search")
-        .query(&[("q", query), ("count", "8")])
-        .header("X-Subscription-Token", key)
-        .header("Accept", "application/json")
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    let results = body["web"]["results"]
-        .as_array()
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    if results.is_empty() {
-        return Ok("no results".into());
-    }
-    Ok(results
+/// Resolve a code-map name (optionally narrowed by a path substring) to exactly
+/// one symbol, or bail with a not-found / ambiguous message listing candidate
+/// locations. Shared by `read_symbol` and `replace_symbol` so the two
+/// symbol-by-name tools agree on what "found" and "ambiguous" mean.
+fn resolve_symbol<'a>(
+    map: &'a codemap::CodeMap,
+    name: &str,
+    path_filter: &str,
+) -> Result<&'a codemap::Symbol> {
+    let candidates: Vec<_> = map
+        .symbols
         .iter()
-        .map(|r| {
-            format!(
-                "{}\n  {}\n  {}",
-                r["title"].as_str().unwrap_or(""),
-                r["url"].as_str().unwrap_or(""),
-                r["description"].as_str().unwrap_or("")
-            )
+        .filter(|sym| sym.name == name || sym.name.ends_with(&format!(".{name}")))
+        .filter(|sym| {
+            path_filter.is_empty() || sym.file.display().to_string().contains(path_filter)
         })
-        .collect::<Vec<_>>()
-        .join("\n"))
+        .collect();
+    match candidates.as_slice() {
+        [] => anyhow::bail!("no symbol named '{name}' in the code map"),
+        [one] => Ok(one),
+        many => anyhow::bail!(
+            "'{name}' is ambiguous; pass `path` to pick one of: {}",
+            many.iter()
+                .map(|s| format!("{}:{}", s.file.display(), s.line))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 /// Brave's "Answers" product — one AI-generated answer backed by real-time
@@ -1027,6 +1039,28 @@ mod tests {
         assert!(now.contains("fn keep()"), "untouched neighbor");
         assert!(now.contains("new()"));
         assert!(!now.contains("old()"));
+    }
+
+    #[tokio::test]
+    async fn read_symbol_returns_just_the_definition() {
+        let tb = toolbox();
+        // Unique name: the test toolbox shares one root + cached code map
+        // across tests, so a duplicated symbol name would collide with another
+        // test's fixture.
+        std::fs::write(
+            tb.root.join("rd.rs"),
+            "fn rd_keep() {\n    1;\n}\n\nfn rd_target() {\n    work();\n}\n",
+        )
+        .unwrap();
+        let out = tb.call("read_symbol", &json!({"name": "rd_target"})).await;
+        assert!(out.contains("fn rd_target()"), "unexpected: {out}");
+        assert!(out.contains("work()"), "unexpected: {out}");
+        assert!(
+            !out.contains("fn rd_keep()"),
+            "should not bleed into neighbor: {out}"
+        );
+        // Numbered, starting at the symbol's real line (5).
+        assert!(out.contains("5|fn rd_target()"), "unexpected: {out}");
     }
 
     #[test]

@@ -41,7 +41,7 @@ fn tool_list() -> Value {
         ),
         tool(
             "symbol_info",
-            "Signature, location, callers and callees of a symbol from the call graph.",
+            "Signature and location of a symbol. Use callers/callees for the call graph.",
             &json!({"name": {"type": "string"}}),
             &["name"]
         ),
@@ -71,7 +71,7 @@ fn tool_list() -> Value {
         ),
         tool(
             "give_cratchit_task",
-            "Dispatch a concrete task to Cratchit, a cheap agent with full tool access (files, shell, python, wolfram, docs, call graph). He executes and returns a short report; a task that changes code ends with a machine-generated CHECKS (format/test/lint) verdict — trust it over his claims; mechanical check failures are already retried automatically. Use this for ALL file reading, editing, and verification instead of doing it yourself.",
+            "Dispatch a concrete task to Cratchit, a cheap agent with full tool access (files, shell, python, docs, call graph). He executes and returns a short report; a task that changes code ends with a machine-generated CHECKS (format/test/lint) verdict — trust it over his claims; mechanical check failures are already retried automatically. Use this for ALL file reading, editing, and verification instead of doing it yourself.",
             &json!({
                 "task": {"type": "string", "description": "overall goal, one line"},
                 "instructions": {"type": "string", "description": "numbered concrete steps naming exact files/symbols"}
@@ -203,7 +203,7 @@ impl Server {
                     tokio::task::spawn_blocking(move || crate::checks::run(&root)).await??;
                 Ok(crate::checks::render(&report))
             }
-            "symbol_info" => Ok(codemap::build_cached(&self.root)?.detail(&s("name"))),
+            "symbol_info" => Ok(codemap::build_cached(&self.root)?.info(&s("name"))),
             "callers" => Ok(crate::tools::or_none(
                 codemap::build_cached(&self.root)?
                     .callers_of(&s("name"))

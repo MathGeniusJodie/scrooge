@@ -579,8 +579,10 @@ impl CodeMap {
         out
     }
 
-    /// Full detail for a subset of symbols (signatures + edges).
-    pub fn detail(&self, name: &str) -> String {
+    /// Signature and location for every symbol matching `name`. Call edges are
+    /// deliberately left out — `callers_of`/`callees_of` own those — so the
+    /// `symbol_info` tool and the `callers`/`callees` tools never overlap.
+    pub fn info(&self, name: &str) -> String {
         let mut out = String::new();
         for s in self
             .symbols
@@ -597,21 +599,26 @@ impl CodeMap {
                 s.signature
             )
             .unwrap();
-            if let Some(callees) = self.calls.get(&s.name) {
-                writeln!(
-                    out,
-                    "  calls: {}",
-                    callees.iter().cloned().collect::<Vec<_>>().join(", ")
-                )
-                .unwrap();
-            }
-            let callers = self.callers_of(&s.name);
-            if !callers.is_empty() {
-                writeln!(out, "  called-by: {}", callers.join(", ")).unwrap();
-            }
         }
         if out.is_empty() {
             out = format!("no symbol named '{name}'");
+        }
+        out
+    }
+
+    /// Human-facing dump for the `sym` CLI command: `info` plus both call
+    /// directions in one place. Composes the tool-facing pieces rather than
+    /// re-deriving them, so the CLI can't drift from what the tools report.
+    #[allow(clippy::similar_names)]
+    pub fn detail(&self, name: &str) -> String {
+        let mut out = self.info(name);
+        let callees = self.callees_of(name);
+        if !callees.is_empty() {
+            writeln!(out, "calls: {}", callees.join(", ")).unwrap();
+        }
+        let callers = self.callers_of(name);
+        if !callers.is_empty() {
+            writeln!(out, "called-by: {}", callers.join(", ")).unwrap();
         }
         out
     }

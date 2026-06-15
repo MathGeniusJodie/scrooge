@@ -48,8 +48,8 @@ After a code-changing step you get a per-step CHECKS verdict; the full test+lint
 suite runs only when you finish. When the task is complete and CHECKS is clean, \
 reply with the single word DONE and no tool calls. No preamble, no prose.";
 
-// Per-tool guidance (when to use python/wolfram, the call graph, query_docs,
-// helpers, search_libraries/add_dependency, line-range reads, etc.) lives on the
+// Per-tool guidance (when to use python, the call graph, query_docs,
+// helpers, web_answer/add_dependency, line-range reads, etc.) lives on the
 // tool definitions in `tools::definitions`; the rules here are only the
 // cross-cutting ones no single tool description owns.
 const CRATCHIT_SYSTEM: &str = "\
