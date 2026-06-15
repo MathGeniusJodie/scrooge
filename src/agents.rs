@@ -5,10 +5,11 @@
 //!
 //! Everything that can be decided deterministically is: the code map and
 //! relevant guidance are injected rather than fetched by the model; every
-//! execution ends with machine-generated CHANGED (git diffstat) and CHECKS
-//! lines appended to the report; mechanical check failures loop straight
-//! back to Cratchit without burning a Scrooge round; and DONE is only
-//! accepted while checks are green.
+//! code-changing execution ends with a machine-generated CHECKS line appended
+//! to the report (Scrooge never sees a diff, only the verdict); mechanical
+//! check failures loop straight back to Cratchit in the same live conversation
+//! without burning a Scrooge round; and DONE is only accepted while checks are
+//! green.
 
 use anyhow::Result;
 use serde_json::Value;
@@ -29,7 +30,10 @@ so you receive only compressed briefs and you produce only terse, high-leverage 
 You never read full files and never write code. Your tools:\n\
 - delegate_to_cratchit: dispatch ONE step to Cratchit, a junior agent with full tool \
   access (files, shell, python, wolfram, docs, call graph). Instructions must be standalone \
-  and imperative, naming exact files/symbols where known.\n\
+  and imperative, naming exact files/symbols where known. You see only this brief, never \
+  file contents: when you need file-level detail before you can plan a change, spend one \
+  delegate_to_cratchit purely to investigate — tell Cratchit to read the relevant files and \
+  report the facts, changing nothing; a read-only step returns just his findings (no CHECKS).\n\
 - symbol_info / callers / callees: free, instant call-graph lookups (a symbol's \
   signature, who calls it, what it calls). Use them to gauge the blast radius of a change \
   before delegating — they cost nothing, so never spend a delegation just to ask who calls \
@@ -37,10 +41,10 @@ You never read full files and never write code. Your tools:\n\
 - web_answer: a concise AI answer from the web. Use SPARINGLY — only when a \
   library/dependency choice or a specific API detail would materially change your next \
   step and you are not sure of it. Not for code in this repo. Most tasks need zero calls.\n\
-Every delegate_to_cratchit report ends with machine-generated CHANGED (git diffstat) and \
-CHECKS (a fast per-step compile verdict; the full test+lint suite runs when you finish) \
-lines — trust those over Cratchit's claims. When the task is complete and CHECKS is clean, \
-reply with the single word DONE and no tool calls. No preamble, no prose.";
+A delegate_to_cratchit step that changes code ends with a machine-generated CHECKS line (a \
+fast per-step compile verdict; the full test+lint suite runs when you finish) — trust it over \
+Cratchit's claims. When the task is complete and CHECKS is clean, reply with the single word \
+DONE and no tool calls. No preamble, no prose.";
 
 const CRATCHIT_SYSTEM: &str = "\
 You are Cratchit, a diligent coding agent executing a plan written by Scrooge, \
@@ -72,20 +76,23 @@ no restating the plan, no code unless a decision depends on it.";
 
 /// One-time briefing for Scrooge — built once, never rebuilt, so the
 /// provider's KV cache keeps it cheap on every subsequent turn.
-/// Placeholders: {TASK} {OVERVIEW} {BRIEF} {CONTEXT} {GUIDANCE}.
+/// Placeholders: {TASK} {OVERVIEW} {BRIEF} {GUIDANCE}.
 const SCROOGE_BRIEF: &str = "\
 TASK: {TASK}\n\nPROJECT OVERVIEW:\n{OVERVIEW}\n\n\
-CODEBASE BRIEF:\n{BRIEF}\nCONTEXT GATHERED BY CRATCHIT:\n{CONTEXT}\n\
-KEY GUIDANCE:\n{GUIDANCE}";
+CODEBASE BRIEF:\n{BRIEF}\nKEY GUIDANCE:\n{GUIDANCE}";
 
-/// Briefing for a fresh Cratchit. Placeholders: {ROOT} {TASK} {OVERVIEW}
-/// {PLAN} {PREV} {CONTEXT} {MAP} {GUIDANCE}.
-/// {GUIDANCE} is a self-contained block (header included) so it disappears
-/// cleanly when withheld — see `cratchit_execute_with`.
+/// Briefing for a fresh Cratchit. Stable-first so the provider's KV cache can
+/// reuse the prefix across every delegation in a run: ROOT/TASK/OVERVIEW/MAP/
+/// GUIDANCE are identical step to step (MAP and GUIDANCE are sliced on the task
+/// alone, not the per-step plan), and only the volatile tail — the step's
+/// instructions and the previous report — changes.
+/// Placeholders: {ROOT} {TASK} {OVERVIEW} {MAP} {GUIDANCE} {PLAN} {PREV}.
+/// {OVERVIEW}/{GUIDANCE}/{PREV} are self-contained blocks (headers included) so
+/// they vanish cleanly when withheld.
 const CRATCHIT_BRIEF: &str = "\
-PROJECT ROOT: {ROOT}\nTASK: {TASK}\n{OVERVIEW}\n\
-SCROOGE'S INSTRUCTIONS:\n{PLAN}\n{PREV}{CONTEXT}\
-CODE MAP (files mentioned in the instructions shown in full):\n{MAP}\n{GUIDANCE}";
+PROJECT ROOT: {ROOT}\nTASK: {TASK}\n{OVERVIEW}\
+CODE MAP (files mentioned in the task shown in full):\n{MAP}\n{GUIDANCE}\
+SCROOGE'S INSTRUCTIONS:\n{PLAN}\n{PREV}";
 
 /// Injected as a user message when Scrooge stops calling tools while CHECKS
 /// is still FAILING, so it is nudged to delegate a fix rather than finish.
@@ -104,19 +111,6 @@ Cratchit, then finish.\n{FAILURES}";
 const CHECK_FAILURE_INSTRUCTIONS: &str = "\
 The deterministic check suite failed after your last changes. Fix the \
 failures below, then verify.\n{FAILURES}";
-
-/// Pre-planning context pass. Cratchit reads whatever the task actually
-/// touches and hands Scrooge the file-level facts the symbol map cannot
-/// carry, so Scrooge plans informed instead of spending a round directing
-/// Cratchit to read files. Placeholder: {TASK}.
-const CONTEXT_INSTRUCTIONS: &str = "\
-Scrooge is about to plan this task, but he sees only a compact symbol map — \
-never file contents. Your job is to pre-filter his context: read the files this \
-task touches (and any config/manifest/doc/README it implies) and report the \
-concrete facts that would shape the plan — the current contents or structure of \
-the relevant file(s), conventions already in play, and anything surprising. Quote \
-the small snippets that matter. Do NOT modify any files and do NOT propose a plan \
-yourself. Your final message is for Scrooge: facts only, no pleasantries.";
 
 /// Instruction to write the overview for a brand-new project (no code yet).
 /// Placeholder: {TASK}.
@@ -202,6 +196,22 @@ const CHECK_RETRIES: usize = 2;
 /// the loop gives up rather than spinning.
 const MAX_FINISH_ATTEMPTS: usize = 4;
 
+/// Per-completion output cap for Scrooge, applied to every planning turn (not a
+/// task-wide budget). Sized to bound a runaway turn while leaving ample room for
+/// a terse delegate instruction. In the rare case a turn hits the cap, the
+/// truncated tool-call JSON is repaired (`parse_tool_args`) and the clipped
+/// instruction is run as-is — we never spend a second turn re-asking.
+const SCROOGE_MAX_TOKENS: u32 = 1024;
+
+/// Output cap for a forced final report (the tool budget ran out). Applied only
+/// to a no-tools completion, so it can never truncate a tool call; a ≤6-line
+/// report fits comfortably.
+const REPORT_MAX_TOKENS: u32 = 512;
+
+/// Tool-call budget for one stretch of a Cratchit conversation (the initial
+/// work, or a single check-failure retry that continues the same conversation).
+const CRATCHIT_MAX_ITERS: usize = 40;
+
 /// Which check suite to run after a delegation. The agent loop runs `Quick`
 /// (a fast compile/typecheck) between steps and `Full` (tests + lint) only to
 /// gate completion; one-shot `scrooge cratchit` runs `Full` directly.
@@ -217,13 +227,9 @@ const MAX_REPORT_LINES: usize = 12;
 const MAX_REPORT_CHARS: usize = 1200;
 
 /// How much of a check-failure dump Scrooge sees. Cratchit already got the
-/// full output during the retry loop; Scrooge only needs the gist.
-const MAX_FAIL_CHARS: usize = 600;
-
-/// Cap on the pre-planning context digest Cratchit hands Scrooge. Roomier than
-/// a report (it carries quoted file snippets) but still bounded so the cheap
-/// model can't bloat every Scrooge briefing.
-const MAX_CONTEXT_CHARS: usize = 2500;
+/// full output during the retry loop; Scrooge only needs the gist — kept
+/// minimal so a clean step costs one line and a red one a short tail.
+const MAX_FAIL_CHARS: usize = 400;
 
 /// Largest char boundary <= `i`, so byte-budget truncation never panics on
 /// multibyte UTF-8 (reports and check output routinely contain `—`, `’`, …).
@@ -311,6 +317,66 @@ fn worktree_changes(root: &Path) -> Option<String> {
     Some(format!("{diff}\n{untracked}").trim().to_string())
 }
 
+/// Parse tool-call arguments, tolerating an object truncated at the end by an
+/// output cap (`finish_reason: length`). A capped Scrooge turn can cut the
+/// arguments mid-value; rather than spend another turn, we close whatever was
+/// left open and run with the surviving (truncated) instruction. Falls back to
+/// `Null` only when even the repair won't parse.
+fn parse_tool_args(raw: &str) -> Value {
+    serde_json::from_str(raw)
+        .or_else(|_| serde_json::from_str(&close_truncated_json(raw)))
+        .unwrap_or(Value::Null)
+}
+
+/// Best-effort close of a JSON fragment cut off at the end: balance an open
+/// string, drop a now-dangling separator, then close every still-open `{`/`[`
+/// in reverse. Good enough for the dominant case — a long string value clipped
+/// mid-content — which is exactly where an output cap lands.
+fn close_truncated_json(raw: &str) -> String {
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_str = false;
+    let mut escaped = false;
+    for c in raw.chars() {
+        if in_str {
+            match (escaped, c) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+    let mut out = raw.to_string();
+    if escaped {
+        out.pop(); // a trailing backslash would escape our closing quote
+    }
+    if in_str {
+        out.push('"');
+    } else {
+        // Cut between elements: drop a dangling comma so the close is valid.
+        while out.ends_with(char::is_whitespace) {
+            out.pop();
+        }
+        if out.ends_with(',') {
+            out.pop();
+        }
+    }
+    while let Some(close) = stack.pop() {
+        out.push(close);
+    }
+    out
+}
+
 pub struct Orchestrator {
     client: Client,
     toolbox: Toolbox,
@@ -339,8 +405,10 @@ impl Orchestrator {
     pub async fn run_task(&mut self, task: &str) -> Result<String> {
         let overview = self.ensure_overview(task).await?;
         let map = codemap::build_cached(&self.toolbox.root)?;
+        // Snapshot the structure now so completion can tell whether the task
+        // touched the architecture and the overview needs re-review (#4).
+        let structure_before = map.structure_signature();
         let guidance = practices::summary(task, &map.languages());
-        let context = self.gather_context(task).await?;
 
         // Built once; becomes the cached prefix for all subsequent turns.
         let mut log = vec![
@@ -351,7 +419,6 @@ impl Orchestrator {
                     .replace("{TASK}", task)
                     .replace("{OVERVIEW}", &overview)
                     .replace("{BRIEF}", &map.brief())
-                    .replace("{CONTEXT}", &context)
                     .replace("{GUIDANCE}", &guidance),
             ),
         ];
@@ -374,7 +441,13 @@ impl Orchestrator {
             }
             let msg = self
                 .client
-                .chat("scrooge", &self.sota_model, &log, &defs, None)
+                .chat(
+                    "scrooge",
+                    &self.sota_model,
+                    &log,
+                    &defs,
+                    Some(SCROOGE_MAX_TOKENS),
+                )
                 .await?;
             log.push(msg.clone());
 
@@ -388,6 +461,7 @@ impl Orchestrator {
                         &mut checks_clean,
                         &mut finish_attempts,
                         delegations,
+                        &structure_before,
                     )
                     .await?
                 {
@@ -397,36 +471,20 @@ impl Orchestrator {
             };
 
             for call in calls {
-                let args: Value =
-                    serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
+                let args: Value = parse_tool_args(&call.function.arguments);
                 let name = call.function.name.clone();
                 let result = if name == "delegate_to_cratchit" {
                     let instructions = args["instructions"].as_str().unwrap_or("").to_string();
                     delegations += 1;
-                    eprintln!("--- scrooge → cratchit (step {delegations}) ---\n{instructions}\n");
-                    // The pre-planning context was paid for once; hand it to the
-                    // first executor too instead of having it re-read the files.
-                    let ctx = if last_report.is_none() && !context.is_empty() {
-                        Some(context.as_str())
-                    } else {
-                        None
-                    };
-                    let (report, verdict) = self
-                        .execute_and_verify(
-                            task,
-                            &instructions,
-                            last_report.as_deref(),
-                            CheckTier::Quick,
-                            ctx,
-                        )
-                        .await?;
-                    if let Some(c) = verdict {
-                        checks_clean = Some(c);
-                        dirty = true;
-                    }
-                    eprintln!("--- cratchit report ---\n{report}\n");
-                    last_report = Some(report.clone());
-                    report
+                    self.run_delegation(
+                        task,
+                        &instructions,
+                        delegations,
+                        &mut last_report,
+                        &mut checks_clean,
+                        &mut dirty,
+                    )
+                    .await?
                 } else if name == "web_answer" {
                     if web_calls >= SCROOGE_WEB_LOOKUPS {
                         "web_answer budget exhausted — decide with what you have and delegate."
@@ -454,6 +512,30 @@ impl Orchestrator {
         Ok("step limit reached without DONE; review output above".into())
     }
 
+    /// Run one Scrooge delegation: execute + verify, fold the verdict into the
+    /// run's running state, and return the report Scrooge will read.
+    async fn run_delegation(
+        &mut self,
+        task: &str,
+        instructions: &str,
+        step: usize,
+        last_report: &mut Option<String>,
+        checks_clean: &mut Option<bool>,
+        dirty: &mut bool,
+    ) -> Result<String> {
+        eprintln!("--- scrooge → cratchit (step {step}) ---\n{instructions}\n");
+        let (report, verdict) = self
+            .execute_and_verify(task, instructions, last_report.as_deref(), CheckTier::Quick)
+            .await?;
+        if let Some(c) = verdict {
+            *checks_clean = Some(c);
+            *dirty = true;
+        }
+        eprintln!("--- cratchit report ---\n{report}\n");
+        *last_report = Some(report.clone());
+        Ok(report)
+    }
+
     /// Handle Scrooge ending his turn without a tool call: decide whether the
     /// task is really done. `Ok(Some(s))` is the final result to return from the
     /// loop; `Ok(None)` means checks are red and Scrooge was nudged to fix them,
@@ -468,6 +550,7 @@ impl Orchestrator {
         checks_clean: &mut Option<bool>,
         finish_attempts: &mut usize,
         delegations: usize,
+        structure_before: &[String],
     ) -> Result<Option<String>> {
         if !dirty {
             return Ok(Some(Self::bill(delegations))); // nothing changed to verify
@@ -498,7 +581,16 @@ impl Orchestrator {
                 "full checks still failing after several attempts; review output".into(),
             ));
         }
-        self.refresh_overview(task).await;
+        // Only reconsider the overview when the change was structural — a pure
+        // internal edit (no added/removed/renamed symbols or changed signatures)
+        // can't make the architecture description stale, so skip the extra
+        // Cratchit pass (#4).
+        let structure_after = codemap::build_cached(&self.toolbox.root)?.structure_signature();
+        if structure_after == *structure_before {
+            eprintln!("--- overview review skipped: no structural change ---");
+        } else {
+            self.refresh_overview(task).await;
+        }
         Ok(Some(Self::bill(delegations)))
     }
 
@@ -532,30 +624,6 @@ impl Orchestrator {
         Ok(text)
     }
 
-    /// Pre-planning context pass: a fresh Cratchit reads what the task touches
-    /// and returns the file-level facts the symbol map can't carry, bounded so
-    /// it can't bloat every Scrooge briefing. Read-only — the same tool set the
-    /// overview passes use, so Cratchit can't write code while reconnoitring.
-    async fn gather_context(&mut self, task: &str) -> Result<String> {
-        eprintln!("--- cratchit gathering context for scrooge ---");
-        let text = self
-            .cratchit_execute_with(
-                task,
-                CONTEXT_INSTRUCTIONS,
-                None,
-                None,
-                Self::context_tools(),
-                true,
-            )
-            .await?;
-        let mut text = text.trim().to_string();
-        if text.len() > MAX_CONTEXT_CHARS {
-            text.truncate(floor_char_boundary(&text, MAX_CONTEXT_CHARS));
-            text.push_str("\n[context clamped]");
-        }
-        Ok(text)
-    }
-
     /// Run Cratchit on an overview instruction and return its trimmed final
     /// message. Shared by `ensure_overview` and `refresh_overview`: both
     /// withhold the file-writing tools (see `overview_tools`) and let the
@@ -564,14 +632,7 @@ impl Orchestrator {
         // No GUIDANCE: writing prose about purpose/architecture is not coding
         // work, so the best-practice sections are noise here.
         let text = self
-            .cratchit_execute_with(
-                task,
-                instructions,
-                None,
-                None,
-                Self::overview_tools(),
-                false,
-            )
+            .cratchit_execute_with(task, instructions, None, Self::overview_tools(), false)
             .await?;
         Ok(text.trim().to_string())
     }
@@ -585,18 +646,6 @@ impl Orchestrator {
             .filter(|d| {
                 !OVERVIEW_WITHHELD_TOOLS.contains(&d["function"]["name"].as_str().unwrap_or(""))
             })
-            .collect()
-    }
-
-    /// Tool set for the pre-planning context pass: read-only lookups only.
-    /// Shell, math, dependency, and docs tools are withheld — context gathering
-    /// is reconnaissance, not execution, and a narrower list costs fewer tokens
-    /// on every API call in the pass.
-    fn context_tools() -> Vec<Value> {
-        const KEEP: &[&str] = &["read_file", "symbol_info", "callers", "callees"];
-        tools::definitions()
-            .into_iter()
-            .filter(|d| KEEP.contains(&d["function"]["name"].as_str().unwrap_or("")))
             .collect()
     }
 
@@ -653,31 +702,31 @@ impl Orchestrator {
         )
     }
 
-    /// Execute instructions via Cratchit, then verify deterministically:
-    /// clamp the report, loop mechanical check failures straight back to
-    /// Cratchit, and append machine-generated CHANGED and CHECKS lines.
-    /// The verdict is None when nothing changed on disk (checks skipped).
+    /// Execute instructions via Cratchit, then verify deterministically. One
+    /// live Cratchit conversation spans the whole dispatch: the initial work and
+    /// every check-failure retry continue the *same* log, so Cratchit keeps the
+    /// edits he just made in context (cheaper and more accurate than re-briefing
+    /// him from scratch with only the prior report text). Scrooge gets back just
+    /// Cratchit's report plus a minimal CHECKS line — never a diff. The verdict
+    /// is None when nothing changed on disk (checks skipped).
     async fn execute_and_verify(
         &mut self,
         task: &str,
         instructions: &str,
         prev_report: Option<&str>,
         tier: CheckTier,
-        context: Option<&str>,
     ) -> Result<(String, Option<bool>)> {
         let before = worktree_changes(&self.toolbox.root);
-        let mut report = clamp_report(
-            &self
-                .cratchit_execute(task, instructions, prev_report, context)
-                .await?,
-        );
+        let defs = tools::definitions();
+        let mut log = self.cratchit_brief(task, instructions, prev_report, true)?;
+        let mut report = clamp_report(&self.run_cratchit(&mut log, &defs).await?);
 
         let after = worktree_changes(&self.toolbox.root);
         if let (Some(b), Some(a)) = (&before, &after)
             && b == a
         {
-            // Investigation-only call: nothing to verify, say so in code.
-            report.push_str("\nCHANGED: nothing (no file modifications)");
+            // Investigation/context-only dispatch: nothing changed, nothing to
+            // verify — Scrooge gets just Cratchit's findings, no CHECKS line.
             return Ok((report, None));
         }
 
@@ -698,28 +747,16 @@ impl Orchestrator {
                 "--- checks failed (cratchit retry {}) ---\n{rendered}",
                 attempt + 1
             );
-            let prev = report.clone();
-            report = clamp_report(
-                &self
-                    .cratchit_execute(
-                        task,
-                        &CHECK_FAILURE_INSTRUCTIONS.replace("{FAILURES}", &rendered),
-                        Some(&prev),
-                        None,
-                    )
-                    .await?,
-            );
+            // Continue the same conversation rather than re-briefing: Cratchit
+            // still has his own edits and tool output in context.
+            log.push(Message::text(
+                "user",
+                CHECK_FAILURE_INSTRUCTIONS.replace("{FAILURES}", &rendered),
+            ));
+            report = clamp_report(&self.run_cratchit(&mut log, &defs).await?);
         }
 
-        // CHANGED reflects the final worktree, including retry fixes.
-        if let Some(a) = worktree_changes(&self.toolbox.root) {
-            let shown = if a.is_empty() {
-                "worktree clean".to_string()
-            } else {
-                a
-            };
-            write!(report, "\nCHANGED:\n{shown}").unwrap();
-        }
+        // No diff for Scrooge — just the verdict, minimal on success.
         if clean {
             report.push_str("\nCHECKS: clean");
         } else {
@@ -744,7 +781,7 @@ impl Orchestrator {
 
     /// Dispatch a pre-planned task to Cratchit (used by MCP mode, where the
     /// Claude Code conversation plays Scrooge). The report carries the same
-    /// machine-generated CHANGED/CHECKS lines as the native loop, plus the
+    /// machine-generated CHECKS line as the native loop, plus the
     /// token bill for this call only (usage accumulates across the server's
     /// lifetime).
     pub async fn delegate(&mut self, task: &str, instructions: &str) -> Result<String> {
@@ -757,7 +794,7 @@ impl Orchestrator {
             self.client.usage.cost_usd,
         );
         let (report, _) = self
-            .execute_and_verify(task, instructions, None, CheckTier::Full, None)
+            .execute_and_verify(task, instructions, None, CheckTier::Full)
             .await?;
         let u = &self.client.usage;
         Ok(format!(
@@ -770,7 +807,7 @@ impl Orchestrator {
 
     /// One-shot question for the cheap model with full tool access.
     pub async fn ask(&mut self, question: &str) -> Result<String> {
-        self.cratchit_execute(question, ASK_INSTRUCTIONS, None, None)
+        self.cratchit_execute(question, ASK_INSTRUCTIONS, None)
             .await
     }
 
@@ -849,7 +886,7 @@ impl Orchestrator {
     /// the result to the log. `who` labels the trace line (scrooge/cratchit).
     async fn dispatch_calls(&self, log: &mut Vec<Message>, calls: Vec<ToolCall>, who: &str) {
         for call in calls {
-            let args: Value = serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
+            let args: Value = parse_tool_args(&call.function.arguments);
             eprintln!(
                 "  [{who}] {}({})",
                 call.function.name,
@@ -865,14 +902,13 @@ impl Orchestrator {
         task: &str,
         plan: &str,
         prev_report: Option<&str>,
-        context: Option<&str>,
     ) -> Result<String> {
-        self.cratchit_execute_with(task, plan, prev_report, context, tools::definitions(), true)
+        self.cratchit_execute_with(task, plan, prev_report, tools::definitions(), true)
             .await
     }
 
-    /// As `cratchit_execute`, but with an explicit tool set. Used by
-    /// `ensure_overview` to withhold the file-writing tools: the overview is
+    /// As `cratchit_execute`, but with an explicit tool set. Used by the
+    /// overview passes to withhold the file-writing tools: the overview is
     /// captured from Cratchit's final message and saved by the orchestrator,
     /// so a Cratchit that writes overview.md itself is only a mistake.
     async fn cratchit_execute_with(
@@ -880,23 +916,36 @@ impl Orchestrator {
         task: &str,
         plan: &str,
         prev_report: Option<&str>,
-        context: Option<&str>,
         defs: Vec<Value>,
         include_guidance: bool,
     ) -> Result<String> {
-        // Inject context deterministically instead of having the model fetch
-        // it: the code map sliced to what the plan mentions, the full
-        // best-practice sections relevant to task + plan, and the previous
-        // round's report so already-paid-for findings aren't re-investigated.
-        let slice_text = format!("{task} {plan}");
+        let mut log = self.cratchit_brief(task, plan, prev_report, include_guidance)?;
+        self.run_cratchit(&mut log, &defs).await
+    }
+
+    /// Build a fresh Cratchit briefing (system prompt + one user message). All
+    /// context is injected deterministically rather than fetched by the model:
+    /// the code map sliced to what the TASK mentions, the relevant best-practice
+    /// sections, the project overview, and the previous round's report. The map
+    /// and guidance slice on the task alone (not the per-step plan) so the
+    /// briefing's head stays byte-identical across a run's delegations and the
+    /// provider's KV cache can reuse it — Cratchit can still read any file the
+    /// plan names. See `CRATCHIT_BRIEF` for the stable-first field order.
+    fn cratchit_brief(
+        &self,
+        task: &str,
+        plan: &str,
+        prev_report: Option<&str>,
+        include_guidance: bool,
+    ) -> Result<Vec<Message>> {
         let full_map = codemap::build_cached(&self.toolbox.root)?;
-        let map = full_map.brief_for(&slice_text);
+        let map = full_map.brief_for(task);
         // Withheld for the overview passes: prose about purpose/architecture is
         // not coding work, so the best-practice sections are just noise there.
         let guidance = if include_guidance {
             format!(
-                "GUIDANCE:\n{}",
-                practices::relevant_sections(&slice_text, &full_map.languages())
+                "GUIDANCE:\n{}\n",
+                practices::relevant_sections(task, &full_map.languages())
             )
         } else {
             String::new()
@@ -909,14 +958,7 @@ impl Orchestrator {
         let prev = prev_report
             .map(|r| format!("\nPREVIOUS ROUND REPORT (already verified facts):\n{r}\n"))
             .unwrap_or_default();
-        // Reconnaissance gathered before planning, handed to the first executor
-        // so it doesn't re-read the same files (empty on later steps, where the
-        // previous report carries the chain forward instead).
-        let ctx = context
-            .filter(|c| !c.trim().is_empty())
-            .map(|c| format!("PRE-PLANNING CONTEXT (facts gathered before planning):\n{c}\n"))
-            .unwrap_or_default();
-        let mut log = vec![
+        Ok(vec![
             Message::text("system", CRATCHIT_SYSTEM),
             Message::text(
                 "user",
@@ -924,15 +966,22 @@ impl Orchestrator {
                     .replace("{ROOT}", &self.toolbox.root.display().to_string())
                     .replace("{TASK}", task)
                     .replace("{OVERVIEW}", &overview)
-                    .replace("{PLAN}", plan)
-                    .replace("{PREV}", &prev)
-                    .replace("{CONTEXT}", &ctx)
                     .replace("{MAP}", &map)
-                    .replace("{GUIDANCE}", &guidance),
+                    .replace("{GUIDANCE}", &guidance)
+                    .replace("{PLAN}", plan)
+                    .replace("{PREV}", &prev),
             ),
-        ];
-        // Tool loop, capped to keep the cheap model from wandering.
-        if let Some(text) = self.tool_loop(&mut log, &defs, 40).await? {
+        ])
+    }
+
+    /// Drive a Cratchit conversation to a final report: loop tool calls until he
+    /// replies with text. If the tool budget is exhausted first, force a final
+    /// report with no tools available — so `REPORT_MAX_TOKENS` can cap it
+    /// without any risk of truncating a tool call mid-JSON. The `log` is taken by
+    /// reference so callers (the check-retry loop) can keep the conversation
+    /// alive across several stretches.
+    async fn run_cratchit(&mut self, log: &mut Vec<Message>, defs: &[Value]) -> Result<String> {
+        if let Some(text) = self.tool_loop(log, defs, CRATCHIT_MAX_ITERS).await? {
             return Ok(text);
         }
         // Tool budget exhausted: force a final report deterministically so
@@ -940,7 +989,13 @@ impl Orchestrator {
         log.push(Message::text("user", CRATCHIT_STOP));
         let msg = self
             .client
-            .chat("cratchit", &self.cheap_model, &log, &[], None)
+            .chat(
+                "cratchit",
+                &self.cheap_model,
+                log,
+                &[],
+                Some(REPORT_MAX_TOKENS),
+            )
             .await?;
         Ok(msg
             .content
@@ -965,5 +1020,28 @@ mod tests {
         assert!(!is_unchanged_verdict(
             "Scrooge is a token-miserly coding agent.\nIt splits planning from execution."
         ));
+    }
+
+    #[test]
+    fn parse_tool_args_recovers_truncated_instruction() {
+        // Well-formed args parse normally.
+        let v = parse_tool_args(r#"{"instructions": "edit foo.rs"}"#);
+        assert_eq!(v["instructions"], "edit foo.rs");
+
+        // Cut mid-string (the output cap's typical landing spot): the surviving
+        // prefix is kept, truncated.
+        let v = parse_tool_args(r#"{"instructions": "edit foo.rs and rename bar to ba"#);
+        assert_eq!(v["instructions"], "edit foo.rs and rename bar to ba");
+
+        // Cut right after an escaped quote inside the string.
+        let v = parse_tool_args(r#"{"instructions": "set the flag to \"on"#);
+        assert_eq!(v["instructions"], "set the flag to \"on");
+
+        // Cut between fields, leaving a dangling comma.
+        let v = parse_tool_args(r#"{"instructions": "do it","#);
+        assert_eq!(v["instructions"], "do it");
+
+        // Unrecoverable garbage falls back to Null rather than panicking.
+        assert!(parse_tool_args("{not json at all").is_null());
     }
 }

@@ -513,6 +513,29 @@ impl CodeMap {
         tags
     }
 
+    /// Structural fingerprint: a sorted list of `(file, kind, name, signature)`,
+    /// deliberately excluding line numbers so a pure line shift (an edit above a
+    /// symbol) does not register as a structural change. Used to decide whether
+    /// a completed task could have made the project overview stale — only a
+    /// changed set of symbols/signatures/files can.
+    pub fn structure_signature(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .symbols
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}|{}|{}|{}",
+                    s.file.display(),
+                    s.kind.short(),
+                    s.name,
+                    s.signature
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
     /// Compact brief: one packed line per file.
     /// Designed to be the cheapest faithful overview of a codebase.
     pub fn brief(&self) -> String {

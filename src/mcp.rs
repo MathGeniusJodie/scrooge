@@ -71,7 +71,7 @@ fn tool_list() -> Value {
         ),
         tool(
             "give_cratchit_task",
-            "Dispatch a concrete task to Cratchit, a cheap agent with full tool access (files, shell, python, wolfram, docs, call graph). He executes and returns a short report ending with machine-generated CHANGED (git diffstat) and CHECKS (format/test/lint verdict) lines — trust those over his claims; mechanical check failures are already retried automatically. Use this for ALL file reading, editing, and verification instead of doing it yourself.",
+            "Dispatch a concrete task to Cratchit, a cheap agent with full tool access (files, shell, python, wolfram, docs, call graph). He executes and returns a short report; a task that changes code ends with a machine-generated CHECKS (format/test/lint) verdict — trust it over his claims; mechanical check failures are already retried automatically. Use this for ALL file reading, editing, and verification instead of doing it yourself.",
             &json!({
                 "task": {"type": "string", "description": "overall goal, one line"},
                 "instructions": {"type": "string", "description": "numbered concrete steps naming exact files/symbols"}

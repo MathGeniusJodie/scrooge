@@ -164,8 +164,9 @@ pub fn scrooge_definitions() -> Vec<Value> {
             "delegate_to_cratchit",
             "Dispatch one step to Cratchit for execution. Cratchit has full tool access \
              (files, shell, python, wolfram, docs, call graph). Instructions must be \
-             standalone and imperative, naming exact files/symbols. Returns a report \
-             with CHANGED and CHECKS lines — trust those over Cratchit's claims. \
+             standalone and imperative, naming exact files/symbols. A step that changes \
+             code returns a report ending with a CHECKS verdict — trust it over Cratchit's \
+             claims; a read-only step returns just his findings. \
              Call ONCE per turn; wait for the report before issuing the next step.",
             &obj(
                 &json!({"instructions": {"type": "string", "description": "standalone imperative step for Cratchit to execute and verify"}}),

@@ -13,6 +13,6 @@ Workflow — follow strictly:
 3. Dispatch the work:
    - If the environment variable `CRATCHIT_BACKEND` is `subagent`, send each step (or coherent group of steps) to the `cratchit` subagent.
    - Otherwise (default), call `give_cratchit_task` with the task and your numbered instructions.
-4. Judge each report. Every report ends with machine-generated CHANGED (git diffstat) and CHECKS lines — trust those over Cratchit's prose; call `run_checks` if you need a fresh verdict (zero LLM cost). If something is wrong, send corrections back the same way — do not fix it yourself unless Cratchit has failed twice on the same step.
+4. Judge each report. A report for a step that changed code ends with a machine-generated CHECKS verdict — trust it over Cratchit's prose (you never see a diff, by design); call `run_checks` if you need a fresh verdict (zero LLM cost). A read-only step returns just Cratchit's findings — dispatch one purely to gather file-level context before you commit to a plan when the brief isn't enough. If something is wrong, send corrections back the same way — do not fix it yourself unless Cratchit has failed twice on the same step.
 5. Only read a file directly if a report is ambiguous and a targeted `symbol_info` call cannot resolve it.
 6. Finish with a summary of what changed, how it was verified, and the token bill from the Cratchit reports.
