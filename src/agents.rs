@@ -20,7 +20,7 @@ use crate::accounting;
 use crate::checks;
 use crate::codemap;
 use crate::helpers::Helper;
-use crate::openrouter::{Client, DEV_MODEL_CHEAP, DEV_MODEL_SOTA, Message, ToolCall};
+use crate::openrouter::{Chat, Client, DEV_MODEL_CHEAP, DEV_MODEL_SOTA, Message, ToolCall};
 use crate::practices;
 use crate::tools::{self, Toolbox};
 
@@ -135,17 +135,19 @@ this way, what must stay true). Do not modify any files. Your final \
 message must be ONLY the overview text, at most 15 lines — it is \
 saved verbatim as overview.md.";
 
-/// Instruction to reconsider the overview after a completed task.
+/// Instruction to rewrite the overview after a completed task. The rewrite is
+/// mandatory — Cratchit always returns a fresh overview, which the orchestrator
+/// saves verbatim (no "UNCHANGED" verdict to second-guess). This pass only runs
+/// when the task changed the code's structure, so a rewrite is always warranted.
 /// Placeholder: {CHANGED}.
 const OVERVIEW_REFRESH_INSTRUCTIONS: &str = "\
-The task above is complete. Review the PROJECT OVERVIEW in your \
-briefing against what changed:\n{CHANGED}\n\n\
-Decide whether the overview's description of purpose or architecture \
-is now stale. Do NOT modify any files. Your final message must be \
-EITHER the single word UNCHANGED (if it is still accurate), OR the \
-full rewritten overview — first line: what the project is in one \
-sentence, then one short prose paragraph on architecture and \
-non-obvious invariants, at most 15 lines. Output ONLY that, nothing else.";
+The task above is complete. The PROJECT OVERVIEW in your briefing may \
+now be stale given what changed:\n{CHANGED}\n\n\
+Rewrite the project overview to match the current state of the code. \
+Do NOT modify any files. Your final message must be ONLY the overview \
+text — first line: what the project is in one sentence, then one short \
+prose paragraph on architecture and non-obvious invariants, at most 15 \
+lines. Output nothing else.";
 
 /// Framing for the one-shot `ask` entry point.
 const ASK_INSTRUCTIONS: &str = "Answer the question directly; investigate with tools first.";
@@ -254,18 +256,6 @@ fn clamp_report(s: &str) -> String {
         out.push_str("\n[report clamped]");
     }
     out
-}
-
-/// True when an overview-review reply means "no rewrite needed". The model is
-/// asked for the single word UNCHANGED but often prefaces it with a sentence of
-/// reasoning ("The architecture is unchanged. UNCHANGED"), so treat the reply
-/// as a verdict if any line, stripped of markdown emphasis/punctuation, is just
-/// UNCHANGED — rather than only the exact-string case.
-fn is_unchanged_verdict(text: &str) -> bool {
-    text.lines().any(|l| {
-        let l = l.trim().trim_matches(|c: char| !c.is_alphanumeric());
-        l.eq_ignore_ascii_case("UNCHANGED")
-    })
 }
 
 /// Short stderr preview of tool-call arguments — a full `write_file` body
@@ -383,15 +373,34 @@ fn close_truncated_json(raw: &str) -> String {
     out
 }
 
-pub struct Orchestrator {
-    client: Client,
+/// Mutable per-task bookkeeping for `run_task`, threaded through the planning
+/// loop's helpers. Bundled into one struct rather than passed as a fistful of
+/// `&mut` scalars (which previously pushed those helpers past 8–10 arguments).
+#[derive(Default)]
+struct RunState {
+    /// Delegations issued so far (also the step number).
+    delegations: usize,
+    /// `web_answer` lookups Scrooge has spent against `SCROOGE_WEB_LOOKUPS`.
+    web_calls: usize,
+    /// Cratchit's most recent report, fed into the next briefing.
+    last_report: Option<String>,
+    /// Latest quick-check verdict: `None` until the first code-changing step.
+    checks_clean: Option<bool>,
+    /// Whether any step has changed code (so checks must gate completion).
+    dirty: bool,
+    /// How many times Scrooge has tried to finish while checks were red.
+    finish_attempts: usize,
+}
+
+pub struct Orchestrator<C = Client> {
+    client: C,
     toolbox: Toolbox,
     cheap_model: String,
     sota_model: String,
     max_steps: usize,
 }
 
-impl Orchestrator {
+impl Orchestrator<Client> {
     pub fn new(root: PathBuf) -> Result<Self> {
         Ok(Self {
             client: Client::new(root.clone())?,
@@ -401,7 +410,9 @@ impl Orchestrator {
             max_steps: 20,
         })
     }
+}
 
+impl<C: Chat + Send + Sync> Orchestrator<C> {
     /// Full task loop: Scrooge delegates to Cratchit via the
     /// `delegate_to_cratchit` tool, sees each report as a tool result, and
     /// adapts step by step. The initial briefing is built once and never
@@ -434,15 +445,10 @@ impl Orchestrator {
         // invalidate the provider's cached prefix on every transition.
         let defs = tools::scrooge_definitions();
 
-        let mut delegations = 0usize;
-        let mut web_calls = 0usize;
-        let mut last_report: Option<String> = None;
-        let mut checks_clean: Option<bool> = None;
-        let mut dirty = false;
-        let mut finish_attempts = 0usize;
+        let mut st = RunState::default();
 
         loop {
-            if delegations >= self.max_steps {
+            if st.delegations >= self.max_steps {
                 break;
             }
             let msg = self
@@ -460,15 +466,7 @@ impl Orchestrator {
             let Some(calls) = msg.tool_calls.filter(|c| !c.is_empty()) else {
                 // Scrooge stopped calling tools — he wants to finish.
                 if let Some(out) = self
-                    .try_finish(
-                        task,
-                        &mut log,
-                        dirty,
-                        &mut checks_clean,
-                        &mut finish_attempts,
-                        delegations,
-                        &structure_before,
-                    )
+                    .try_finish(task, &mut log, &mut st, &structure_before)
                     .await?
                 {
                     return Ok(out);
@@ -478,24 +476,14 @@ impl Orchestrator {
 
             // A turn cut off by the output cap may carry a clipped tool call;
             // only then do we let parse_tool_args attempt a repair.
-            let truncated = self.client.last_finish_reason.as_deref() == Some("length");
+            let truncated = self.client.last_finish_reason() == Some("length");
             // At most one delegation per turn: Cratchit's report (and its CHECKS
             // verdict) must come back before the next step is planned, so a
             // second delegate call in the same turn was planned blind.
             let mut delegated = false;
             for call in calls {
                 let result = self
-                    .run_scrooge_call(
-                        task,
-                        &call,
-                        truncated,
-                        &mut delegated,
-                        &mut delegations,
-                        &mut web_calls,
-                        &mut last_report,
-                        &mut checks_clean,
-                        &mut dirty,
-                    )
+                    .run_scrooge_call(task, &call, truncated, &mut delegated, &mut st)
                     .await?;
                 log.push(Message::tool_result(&call.id, result));
             }
@@ -509,21 +497,26 @@ impl Orchestrator {
         &mut self,
         task: &str,
         instructions: &str,
-        step: usize,
-        last_report: &mut Option<String>,
-        checks_clean: &mut Option<bool>,
-        dirty: &mut bool,
+        st: &mut RunState,
     ) -> Result<String> {
-        eprintln!("--- scrooge → cratchit (step {step}) ---\n{instructions}\n");
+        eprintln!(
+            "--- scrooge → cratchit (step {}) ---\n{instructions}\n",
+            st.delegations
+        );
         let (report, verdict) = self
-            .execute_and_verify(task, instructions, last_report.as_deref(), CheckTier::Quick)
+            .execute_and_verify(
+                task,
+                instructions,
+                st.last_report.as_deref(),
+                CheckTier::Quick,
+            )
             .await?;
         if let Some(c) = verdict {
-            *checks_clean = Some(c);
-            *dirty = true;
+            st.checks_clean = Some(c);
+            st.dirty = true;
         }
         eprintln!("--- cratchit report ---\n{report}\n");
-        *last_report = Some(report.clone());
+        st.last_report = Some(report.clone());
         Ok(report)
     }
 
@@ -537,11 +530,7 @@ impl Orchestrator {
         call: &ToolCall,
         truncated: bool,
         delegated: &mut bool,
-        delegations: &mut usize,
-        web_calls: &mut usize,
-        last_report: &mut Option<String>,
-        checks_clean: &mut Option<bool>,
-        dirty: &mut bool,
+        st: &mut RunState,
     ) -> Result<String> {
         let args: Value = parse_tool_args(&call.function.arguments, truncated);
         let name = call.function.name.clone();
@@ -568,26 +557,17 @@ impl Orchestrator {
                 );
             }
             *delegated = true;
-            *delegations += 1;
-            return self
-                .run_delegation(
-                    task,
-                    &instructions,
-                    *delegations,
-                    last_report,
-                    checks_clean,
-                    dirty,
-                )
-                .await;
+            st.delegations += 1;
+            return self.run_delegation(task, &instructions, st).await;
         }
         if name == "web_answer" {
-            if *web_calls >= SCROOGE_WEB_LOOKUPS {
+            if st.web_calls >= SCROOGE_WEB_LOOKUPS {
                 return Ok(
                     "web_answer budget exhausted — decide with what you have and delegate."
                         .to_string(),
                 );
             }
-            *web_calls += 1;
+            st.web_calls += 1;
         }
         // web_answer (within budget) and the free, deterministic call-graph
         // lookups (symbol_info / callers / callees) are answered locally.
@@ -608,19 +588,16 @@ impl Orchestrator {
         &mut self,
         task: &str,
         log: &mut Vec<Message>,
-        dirty: bool,
-        checks_clean: &mut Option<bool>,
-        finish_attempts: &mut usize,
-        delegations: usize,
+        st: &mut RunState,
         structure_before: &[String],
     ) -> Result<Option<String>> {
-        if !dirty {
-            return Ok(Some(Self::bill(delegations))); // nothing changed to verify
+        if !st.dirty {
+            return Ok(Some(Self::bill(st.delegations))); // nothing changed to verify
         }
-        if *checks_clean == Some(false) {
+        if st.checks_clean == Some(false) {
             // Quick checks from the last step are still red.
-            if *finish_attempts < MAX_FINISH_ATTEMPTS {
-                *finish_attempts += 1;
+            if st.finish_attempts < MAX_FINISH_ATTEMPTS {
+                st.finish_attempts += 1;
                 log.push(Message::text("user", SCROOGE_DONE_WITH_FAILURES));
                 return Ok(None);
             }
@@ -629,9 +606,9 @@ impl Orchestrator {
         // Quick checks are green; run the full suite once before accepting DONE.
         let full = self.run_checks(CheckTier::Full).await?;
         if !full.errors.is_empty() || !full.warnings.is_empty() {
-            if *finish_attempts < MAX_FINISH_ATTEMPTS {
-                *finish_attempts += 1;
-                *checks_clean = Some(false);
+            if st.finish_attempts < MAX_FINISH_ATTEMPTS {
+                st.finish_attempts += 1;
+                st.checks_clean = Some(false);
                 let failures = tail(&checks::render(&full), MAX_FAIL_CHARS);
                 log.push(Message::text(
                     "user",
@@ -653,7 +630,7 @@ impl Orchestrator {
         } else {
             self.refresh_overview(task).await;
         }
-        Ok(Some(Self::bill(delegations)))
+        Ok(Some(Self::bill(st.delegations)))
     }
 
     /// Load .scrooge/overview.md, having Cratchit write it first if missing.
@@ -729,8 +706,10 @@ impl Orchestrator {
         let instructions = OVERVIEW_REFRESH_INSTRUCTIONS.replace("{CHANGED}", &changed);
         match self.cratchit_overview(task, &instructions).await {
             Ok(text) => {
-                if text.is_empty() || is_unchanged_verdict(&text) {
-                    eprintln!("--- overview review: unchanged ---");
+                if text.is_empty() {
+                    // A rewrite is mandatory, but an empty reply has nothing to
+                    // save — keep the existing overview rather than blanking it.
+                    eprintln!("--- overview review: empty reply, keeping existing ---");
                 } else if let Err(e) = crate::overview::save(&root, &text) {
                     eprintln!("[overview save failed (task still complete): {e:#}]");
                 } else {
@@ -751,7 +730,7 @@ impl Orchestrator {
     /// it all on the pricey Scrooge model. The usage is per-request because the
     /// orchestrator is built fresh for each command invocation.
     pub fn wages_footer(&self) -> String {
-        let u = &self.client.usage;
+        let u = self.client.usage();
         let saved = accounting::shillings_saved(
             &self.toolbox.root,
             u.prompt_tokens,
@@ -851,14 +830,14 @@ impl Orchestrator {
         // is planned against the codebase.
         self.ensure_overview(task).await?;
         let before = (
-            self.client.usage.prompt_tokens,
-            self.client.usage.completion_tokens,
-            self.client.usage.cost_usd,
+            self.client.usage().prompt_tokens,
+            self.client.usage().completion_tokens,
+            self.client.usage().cost_usd,
         );
         let (report, _) = self
             .execute_and_verify(task, instructions, None, CheckTier::Full)
             .await?;
-        let u = &self.client.usage;
+        let u = self.client.usage();
         Ok(format!(
             "{report}\n[cratchit tokens: {} in / {} out (${:.4})]",
             u.prompt_tokens - before.0,
@@ -939,7 +918,7 @@ impl Orchestrator {
             let Some(calls) = msg.tool_calls.filter(|c| !c.is_empty()) else {
                 return Ok(Some(msg.content.unwrap_or_default()));
             };
-            let truncated = self.client.last_finish_reason.as_deref() == Some("length");
+            let truncated = self.client.last_finish_reason() == Some("length");
             self.dispatch_calls(log, calls, "cratchit", truncated).await;
         }
         Ok(None)
@@ -1076,19 +1055,109 @@ impl Orchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::openrouter::{FunctionCall, Usage};
+    use std::collections::VecDeque;
 
-    #[test]
-    fn unchanged_verdict_tolerates_preamble() {
-        assert!(is_unchanged_verdict("UNCHANGED"));
-        assert!(is_unchanged_verdict(
-            "The architecture still holds.\nUNCHANGED"
-        ));
-        assert!(is_unchanged_verdict("**UNCHANGED**"));
-        assert!(is_unchanged_verdict("unchanged."));
-        // A real rewritten overview is not a verdict.
-        assert!(!is_unchanged_verdict(
-            "Scrooge is a token-miserly coding agent.\nIt splits planning from execution."
-        ));
+    /// A scripted `Chat` backend: each `chat` call pops the next canned reply.
+    /// Lets the agent loop be exercised end-to-end with zero network access —
+    /// no request ever leaves the process.
+    struct FakeChat {
+        replies: VecDeque<Message>,
+        usage: Usage,
+    }
+
+    impl FakeChat {
+        fn new(replies: Vec<Message>) -> Self {
+            Self {
+                replies: replies.into(),
+                usage: Usage::default(),
+            }
+        }
+    }
+
+    impl Chat for FakeChat {
+        async fn chat(
+            &mut self,
+            _agent: &str,
+            _model: &str,
+            _messages: &[Message],
+            _tools: &[Value],
+            _max_tokens: Option<u32>,
+        ) -> Result<Message> {
+            Ok(self
+                .replies
+                .pop_front()
+                .expect("FakeChat ran out of scripted replies"))
+        }
+        fn usage(&self) -> &Usage {
+            &self.usage
+        }
+        fn last_finish_reason(&self) -> Option<&str> {
+            None
+        }
+    }
+
+    fn tool_call_msg(id: &str, name: &str, arguments: &str) -> Message {
+        Message {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: id.into(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: name.into(),
+                    arguments: arguments.into(),
+                },
+            }]),
+            tool_call_id: None,
+        }
+    }
+
+    fn orchestrator(client: FakeChat) -> Orchestrator<FakeChat> {
+        let root = std::env::temp_dir().join(format!("scrooge-fake-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        Orchestrator {
+            client,
+            toolbox: Toolbox::new(root),
+            cheap_model: "fake-cheap".into(),
+            sota_model: "fake-sota".into(),
+            max_steps: 20,
+        }
+    }
+
+    /// The shared Cratchit loop dispatches a scripted tool call against the real
+    /// (deterministic, offline) toolbox, then returns the model's final text —
+    /// all from spoofed replies, proving the loop never touches the network.
+    #[tokio::test]
+    async fn tool_loop_dispatches_then_returns_final_text() {
+        // Reply 1: ask for a free, offline call-graph lookup. Reply 2: the
+        // final report once the tool result is in hand.
+        let mut orch = orchestrator(FakeChat::new(vec![
+            tool_call_msg("c1", "callers", r#"{"name": "nonexistent_fn"}"#),
+            Message::text("assistant", "done: examined the call graph"),
+        ]));
+        let defs = tools::definitions();
+        let mut log = vec![Message::text("user", "investigate")];
+        let out = orch.tool_loop(&mut log, &defs, 40).await.unwrap();
+        assert_eq!(out.as_deref(), Some("done: examined the call graph"));
+        // The tool result for the dispatched call landed back in the log.
+        assert!(
+            log.iter().any(|m| m.tool_call_id.as_deref() == Some("c1")),
+            "expected a tool result for the dispatched call in the log"
+        );
+    }
+
+    /// When the model never asks for a tool, the loop returns its text on the
+    /// first turn without spending any of the iteration budget on tools.
+    #[tokio::test]
+    async fn tool_loop_returns_immediately_without_tool_calls() {
+        let mut orch = orchestrator(FakeChat::new(vec![Message::text(
+            "assistant",
+            "no tools needed",
+        )]));
+        let mut log = vec![Message::text("user", "answer directly")];
+        let out = orch.tool_loop(&mut log, &[], 40).await.unwrap();
+        assert_eq!(out.as_deref(), Some("no tools needed"));
     }
 
     #[test]

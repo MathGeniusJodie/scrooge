@@ -84,11 +84,43 @@ impl Client {
             last_finish_reason: None,
         })
     }
+}
+
+/// The chat backend the orchestrator talks to. Abstracted behind a trait so the
+/// agent loop can be driven by a scripted fake in tests — no live API calls —
+/// while production uses `Client` over `OpenRouter`. `-> impl Future + Send`
+/// (rather than `async fn`) keeps the returned future `Send` for the
+/// multi-threaded runtime without pulling in `async_trait`.
+pub trait Chat {
+    fn chat(
+        &mut self,
+        agent: &str,
+        model: &str,
+        messages: &[Message],
+        tools: &[Value],
+        max_tokens: Option<u32>,
+    ) -> impl std::future::Future<Output = Result<Message>> + Send;
+
+    /// Cumulative token/cost usage across this backend's lifetime.
+    fn usage(&self) -> &Usage;
+
+    /// `finish_reason` of the most recent completion, if any.
+    fn last_finish_reason(&self) -> Option<&str>;
+}
+
+impl Chat for Client {
+    fn usage(&self) -> &Usage {
+        &self.usage
+    }
+
+    fn last_finish_reason(&self) -> Option<&str> {
+        self.last_finish_reason.as_deref()
+    }
 
     /// One chat completion. `agent` ("scrooge"/"cratchit") attributes the
     /// tokens in the ledger. `tools` is an OpenAI-format tool list or empty.
     /// `max_tokens` hard-caps the completion (used to keep Scrooge terse).
-    pub async fn chat(
+    async fn chat(
         &mut self,
         agent: &str,
         model: &str,

@@ -6,9 +6,18 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use tokio::process::Command;
 
 use crate::codemap;
+
+/// Process-wide `reqwest` client for the web/doc tools. Built once and reused so
+/// every lookup shares one connection pool instead of standing up a fresh client
+/// (and pool) per call.
+fn http() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
 
 pub struct Toolbox {
     pub root: PathBuf,
@@ -362,8 +371,13 @@ impl Toolbox {
             "read_file" => {
                 let path = self.resolve(&s("path"));
                 let content = std::fs::read_to_string(&path)?;
-                let start = args["start_line"].as_u64().map(|n| n as usize);
                 let end = args["end_line"].as_u64().map(|n| n as usize);
+                // A bare end_line (no start) reads from line 1 rather than
+                // silently falling through to a whole-file read.
+                let start = args["start_line"]
+                    .as_u64()
+                    .map(|n| n as usize)
+                    .or_else(|| end.map(|_| 1));
                 Ok(if let (Some(a), b) = (start, end) {
                     // Cap range size too, or 1..999999 would bypass the
                     // whole-file guard below.
@@ -713,7 +727,7 @@ impl Toolbox {
                 // instead of dumping the raw payload on the model.
                 let q = query.replace(' ', "+");
                 let url = format!("https://developer.mozilla.org/api/v1/search?q={q}&locale=en-US");
-                let v: Value = reqwest::Client::new()
+                let v: Value = http()
                     .get(&url)
                     .header("User-Agent", "scrooge-agent")
                     .send()
@@ -774,7 +788,7 @@ mod sandbox {
 async fn web_search(query: &str) -> Result<String> {
     let key = std::env::var("BRAVE_SEARCH_KEY")
         .map_err(|_| anyhow::anyhow!("BRAVE_SEARCH_KEY is not set"))?;
-    let body: Value = reqwest::Client::new()
+    let body: Value = http()
         .get("https://api.search.brave.com/res/v1/web/search")
         .query(&[("q", query), ("count", "8")])
         .header("X-Subscription-Token", key)
@@ -813,7 +827,7 @@ async fn web_search(query: &str) -> Result<String> {
 async fn web_answer(query: &str) -> Result<String> {
     let key = std::env::var("BRAVE_ANSWERS_KEY")
         .map_err(|_| anyhow::anyhow!("BRAVE_ANSWERS_KEY is not set"))?;
-    let body: Value = reqwest::Client::new()
+    let body: Value = http()
         .post("https://api.search.brave.com/res/v1/chat/completions")
         .bearer_auth(&key)
         .json(&json!({
@@ -848,7 +862,7 @@ fn html_to_text(body: &str) -> Result<String> {
 /// GET a page and return its de-tagged text, or None on a non-2xx status
 /// (e.g. a 404), so callers can fall through to the next candidate URL.
 async fn fetch_doc(url: &str) -> Result<Option<String>> {
-    let resp = reqwest::Client::new()
+    let resp = http()
         .get(url)
         .header("User-Agent", "scrooge-agent")
         .send()
