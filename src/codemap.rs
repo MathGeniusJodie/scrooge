@@ -91,8 +91,9 @@ const MAX_FILE_BYTES: u64 = 262_144;
 
 /// All indexable source files under `root`, skipping vendored/build dirs.
 /// Shared by `build_limited` and `cache_key` so the cache key and the build
-/// always agree on what counts as a source file.
-fn source_files(root: &Path) -> impl Iterator<Item = walkdir::DirEntry> {
+/// always agree on what counts as a source file; also reused by the file-length
+/// lint in `checks.rs`.
+pub fn source_files(root: &Path) -> impl Iterator<Item = walkdir::DirEntry> {
     WalkDir::new(root)
         .into_iter()
         .filter_entry(|e| {

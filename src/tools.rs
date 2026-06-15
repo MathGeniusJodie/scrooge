@@ -36,7 +36,7 @@ pub fn definitions() -> Vec<Value> {
     vec![
         tool(
             "read_file",
-            "Read a file. Files over 400 lines return an outline instead; pass start_line/end_line (max 250 lines per call).",
+            "Read a file. Files over 2000 lines return an outline instead; pass start_line/end_line (max 2000 lines per call). Prefer narrow ranges — reading whole large files burns context.",
             &obj(
                 &json!({
                     "path": {"type": "string"},
@@ -153,8 +153,11 @@ pub fn definitions() -> Vec<Value> {
     ]
 }
 
-/// Scrooge's tools. `delegate_to_cratchit` is the primary workhorse;
-/// `web_answer` is withheld after `SCROOGE_WEB_LOOKUPS` uses.
+/// Scrooge's tools. `delegate_to_cratchit` is the workhorse; `symbol_info` /
+/// `callers` / `callees` are free, deterministic call-graph lookups answered
+/// locally (no Cratchit round); `web_answer` is rate-limited to
+/// `SCROOGE_WEB_LOOKUPS` uses. The list is stable across a task so the
+/// provider's KV cache survives every turn.
 pub fn scrooge_definitions() -> Vec<Value> {
     vec![
         tool(
@@ -170,6 +173,21 @@ pub fn scrooge_definitions() -> Vec<Value> {
             ),
         ),
         tool(
+            "symbol_info",
+            "Free, instant lookup: signature, location, callers and callees of a symbol. Use it to judge the blast radius of a change before delegating — it costs nothing.",
+            &obj(&json!({"name": {"type": "string"}}), &["name"]),
+        ),
+        tool(
+            "callers",
+            "Free, instant lookup: the functions that call the named function.",
+            &obj(&json!({"name": {"type": "string"}}), &["name"]),
+        ),
+        tool(
+            "callees",
+            "Free, instant lookup: the functions the named function calls.",
+            &obj(&json!({"name": {"type": "string"}}), &["name"]),
+        ),
+        tool(
             "web_answer",
             "Get one concise AI-summarized answer from the web (Brave summarizer, not a link list). Use SPARINGLY — only to settle a library/dependency choice or a specific API/implementation detail you are unsure of. Not for code in this repo (you already have the brief).",
             &obj(
@@ -180,22 +198,21 @@ pub fn scrooge_definitions() -> Vec<Value> {
     ]
 }
 
-/// Scrooge's tool set after the web-answer budget is exhausted.
-pub fn scrooge_delegate_only() -> Vec<Value> {
-    scrooge_definitions()
-        .into_iter()
-        .filter(|d| d["function"]["name"] == "delegate_to_cratchit")
-        .collect()
-}
-
 const MAX_OUTPUT: usize = 8000;
+
+/// `read_file` can legitimately return far more than a shell command (a whole
+/// file up to `MAX_WHOLE_FILE_LINES`), so it gets a roomier truncation budget;
+/// everything else stays capped at `MAX_OUTPUT`.
+const READ_FILE_MAX_CHARS: usize = 120_000;
 
 /// Whole-file reads above this are refused with an outline instead, so the
 /// "read line ranges" rule is enforced in code rather than pleaded in prompts.
-const MAX_WHOLE_FILE_LINES: usize = 400;
+/// Matches the file-length lint threshold in `checks.rs` — files kept under it
+/// are readable whole; anything larger should be split.
+const MAX_WHOLE_FILE_LINES: usize = 2000;
 
 /// Largest line range a single `read_file` call returns.
-const MAX_RANGE_LINES: usize = 250;
+const MAX_RANGE_LINES: usize = 2000;
 
 /// Whitespace-tolerant match: byte ranges of line windows whose trimmed
 /// lines equal the trimmed lines of `find`.
@@ -226,16 +243,17 @@ fn fuzzy_match_ranges(content: &str, find: &str) -> Vec<(usize, usize)> {
 
 /// Keep head AND tail when truncating: compiler errors and test failures
 /// land at the end of long outputs, which a head-only cut would discard.
-fn truncate(s: String) -> String {
-    const HEAD: usize = 2000;
-    if s.len() <= MAX_OUTPUT {
+/// `max` is the per-tool budget (`read_file` gets a bigger one than shell).
+fn truncate(s: String, max: usize) -> String {
+    if s.len() <= max {
         return s;
     }
-    let mut head_end = HEAD;
+    let head = max / 4;
+    let mut head_end = head;
     while !s.is_char_boundary(head_end) {
         head_end -= 1;
     }
-    let mut tail_start = s.len() - (MAX_OUTPUT - HEAD);
+    let mut tail_start = s.len() - (max - head);
     while !s.is_char_boundary(tail_start) {
         tail_start += 1;
     }
@@ -325,10 +343,18 @@ impl Toolbox {
 
     pub async fn call(&self, name: &str, args: &Value) -> String {
         let result = self.dispatch(name, args).await;
-        truncate(match result {
-            Ok(s) => s,
-            Err(e) => format!("error: {e:#}"),
-        })
+        let max = if name == "read_file" {
+            READ_FILE_MAX_CHARS
+        } else {
+            MAX_OUTPUT
+        };
+        truncate(
+            match result {
+                Ok(s) => s,
+                Err(e) => format!("error: {e:#}"),
+            },
+            max,
+        )
     }
 
     async fn dispatch(&self, name: &str, args: &Value) -> Result<String> {
@@ -687,25 +713,7 @@ impl Toolbox {
     async fn query_docs(&self, lang: &str, query: &str) -> Result<String> {
         match lang {
             "python" => self.run("python3", &["-m", "pydoc", query]).await,
-            "rust" => {
-                // docs.rs serves a text-friendly page per crate/item; strip
-                // tags, then skip the nav boilerplate before the item itself.
-                let krate = query.split("::").next().unwrap_or(query);
-                let item = query.replace("::", "/");
-                let url = if krate == query {
-                    format!("https://docs.rs/{krate}/latest/{krate}/")
-                } else {
-                    format!("https://docs.rs/{krate}/latest/{item}/")
-                };
-                let text = fetch_text(&url).await?;
-                let needle = query.rsplit("::").next().unwrap_or(query);
-                let start = text.find(needle).unwrap_or(0);
-                let mut end = (start + 4000).min(text.len());
-                while !text.is_char_boundary(end) {
-                    end -= 1;
-                }
-                Ok(text[start..end].to_string())
-            }
+            "rust" => rust_doc(query).await,
             "js" => {
                 // MDN's search API returns JSON; extract title/summary/url
                 // instead of dumping the raw payload on the model.
@@ -834,20 +842,92 @@ async fn web_answer(query: &str) -> Result<String> {
     Ok(answer.to_string())
 }
 
-async fn fetch_text(url: &str) -> Result<String> {
-    let body = reqwest::Client::new()
-        .get(url)
-        .header("User-Agent", "scrooge-agent")
-        .send()
-        .await?
-        .text()
-        .await?;
-    // Crude HTML -> text: drop scripts/styles/tags, collapse whitespace.
-    let no_script = regex::Regex::new(r"(?s)<(script|style)[^>]*>.*?</(script|style)>")?
-        .replace_all(&body, " ");
+/// Crude HTML -> text: drop scripts/styles/tags, collapse whitespace.
+fn html_to_text(body: &str) -> Result<String> {
+    let no_script =
+        regex::Regex::new(r"(?s)<(script|style)[^>]*>.*?</(script|style)>")?.replace_all(body, " ");
     let no_tags = regex::Regex::new(r"<[^>]+>")?.replace_all(&no_script, " ");
     let collapsed = regex::Regex::new(r"\s+")?.replace_all(&no_tags, " ");
     Ok(collapsed.trim().to_string())
+}
+
+/// GET a page and return its de-tagged text, or None on a non-2xx status
+/// (e.g. a 404), so callers can fall through to the next candidate URL.
+async fn fetch_doc(url: &str) -> Result<Option<String>> {
+    let resp = reqwest::Client::new()
+        .get(url)
+        .header("User-Agent", "scrooge-agent")
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+    Ok(Some(html_to_text(&resp.text().await?)?))
+}
+
+/// docs.rs lookup that resolves an item to its real page instead of guessing a
+/// single URL. A bare crate name fetches the crate root; for `crate::Item` we
+/// try each rustdoc item-kind filename (`struct.Item.html`, `enum.Item.html`,
+/// …) under the item's module path, plus a module page, and use the first that
+/// exists. The old single-URL scrape 404'd on essentially every non-trivial
+/// path because rustdoc filenames carry a kind prefix it omitted.
+/// rustdoc item-kind filename prefixes, tried in turn against a module path.
+const RUST_DOC_KINDS: &[&str] = &[
+    "struct",
+    "enum",
+    "trait",
+    "fn",
+    "type",
+    "macro",
+    "constant",
+    "derive",
+    "union",
+    "primitive",
+    "static",
+];
+
+async fn rust_doc(query: &str) -> Result<String> {
+    let mut segs: Vec<&str> = query.split("::").filter(|s| !s.is_empty()).collect();
+    let Some(krate) = segs.first().copied() else {
+        return Ok("empty query".into());
+    };
+    let root = format!("https://docs.rs/{krate}/latest/{krate}/");
+    let text = if segs.len() <= 1 {
+        fetch_doc(&format!("{root}index.html")).await?
+    } else {
+        let item = segs.pop().unwrap();
+        let modpath = segs[1..].join("/");
+        let base = if modpath.is_empty() {
+            root.clone()
+        } else {
+            format!("{root}{modpath}/")
+        };
+        let mut found = None;
+        for kind in RUST_DOC_KINDS {
+            if let Some(t) = fetch_doc(&format!("{base}{kind}.{item}.html")).await? {
+                found = Some(t);
+                break;
+            }
+        }
+        // Fall back to treating the final segment as a module.
+        if found.is_none() {
+            found = fetch_doc(&format!("{base}{item}/index.html")).await?;
+        }
+        found
+    };
+    let Some(text) = text else {
+        return Ok(format!(
+            "no docs.rs page found for `{query}` — check the crate/item path"
+        ));
+    };
+    // Skip the nav boilerplate: start at the item name, then take a window.
+    let needle = query.rsplit("::").next().unwrap_or(query);
+    let start = text.find(needle).unwrap_or(0);
+    let mut end = (start + 4000).min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    Ok(text[start..end].to_string())
 }
 
 #[cfg(test)]
@@ -948,7 +1028,7 @@ mod tests {
     #[test]
     fn truncate_keeps_head_and_tail() {
         let s = format!("HEAD{}TAIL", "x".repeat(MAX_OUTPUT * 2));
-        let t = truncate(s);
+        let t = truncate(s, MAX_OUTPUT);
         assert!(t.starts_with("HEAD"));
         assert!(t.ends_with("TAIL"));
         assert!(t.contains("truncated"));

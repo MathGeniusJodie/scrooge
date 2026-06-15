@@ -26,17 +26,21 @@ use crate::tools::{self, Toolbox};
 const SCROOGE_SYSTEM: &str = "\
 You are Scrooge, a senior software architect. Your time is extremely valuable, \
 so you receive only compressed briefs and you produce only terse, high-leverage output. \
-You never read full files and never write code. You have two tools:\n\
+You never read full files and never write code. Your tools:\n\
 - delegate_to_cratchit: dispatch ONE step to Cratchit, a junior agent with full tool \
   access (files, shell, python, wolfram, docs, call graph). Instructions must be standalone \
   and imperative, naming exact files/symbols where known.\n\
+- symbol_info / callers / callees: free, instant call-graph lookups (a symbol's \
+  signature, who calls it, what it calls). Use them to gauge the blast radius of a change \
+  before delegating — they cost nothing, so never spend a delegation just to ask who calls \
+  what.\n\
 - web_answer: a concise AI answer from the web. Use SPARINGLY — only when a \
   library/dependency choice or a specific API detail would materially change your next \
   step and you are not sure of it. Not for code in this repo. Most tasks need zero calls.\n\
 Every delegate_to_cratchit report ends with machine-generated CHANGED (git diffstat) and \
-CHECKS (format/test/lint verdict) lines — trust those over Cratchit's claims. When the \
-task is complete and CHECKS is clean, reply with the single word DONE and no tool calls. \
-No preamble, no prose.";
+CHECKS (a fast per-step compile verdict; the full test+lint suite runs when you finish) \
+lines — trust those over Cratchit's claims. When the task is complete and CHECKS is clean, \
+reply with the single word DONE and no tool calls. No preamble, no prose.";
 
 const CRATCHIT_SYSTEM: &str = "\
 You are Cratchit, a diligent coding agent executing a plan written by Scrooge, \
@@ -75,10 +79,10 @@ CODEBASE BRIEF:\n{BRIEF}\nCONTEXT GATHERED BY CRATCHIT:\n{CONTEXT}\n\
 KEY GUIDANCE:\n{GUIDANCE}";
 
 /// Briefing for a fresh Cratchit. Placeholders: {ROOT} {TASK} {OVERVIEW}
-/// {PLAN} {PREV} {MAP} {GUIDANCE}.
+/// {PLAN} {PREV} {CONTEXT} {MAP} {GUIDANCE}.
 const CRATCHIT_BRIEF: &str = "\
 PROJECT ROOT: {ROOT}\nTASK: {TASK}\n{OVERVIEW}\n\
-SCROOGE'S INSTRUCTIONS:\n{PLAN}\n{PREV}\n\
+SCROOGE'S INSTRUCTIONS:\n{PLAN}\n{PREV}{CONTEXT}\
 CODE MAP (files mentioned in the instructions shown in full):\n{MAP}\n\
 GUIDANCE:\n{GUIDANCE}";
 
@@ -86,6 +90,13 @@ GUIDANCE:\n{GUIDANCE}";
 /// is still FAILING, so it is nudged to delegate a fix rather than finish.
 const SCROOGE_DONE_WITH_FAILURES: &str = "\
 CHECKS are still FAILING — do not stop. Call delegate_to_cratchit to fix the failures.";
+
+/// Injected when Scrooge tries to finish but the full check suite — tests +
+/// lint, run only at completion — turned up failures the per-step quick check
+/// didn't. Placeholder: {FAILURES}.
+const FINISH_BLOCKED: &str = "\
+Not done yet: the full check suite (tests + lint) failed. Delegate a fix to \
+Cratchit, then finish.\n{FAILURES}";
 
 /// Sent back to Cratchit inside the verify loop when checks fail.
 /// Placeholder: {FAILURES}.
@@ -185,6 +196,19 @@ const SCROOGE_WEB_LOOKUPS: usize = 3;
 /// How many times a failing check report is routed straight back to Cratchit
 /// before the failure is escalated to Scrooge.
 const CHECK_RETRIES: usize = 2;
+
+/// How many times Scrooge may try to finish while checks are still red before
+/// the loop gives up rather than spinning.
+const MAX_FINISH_ATTEMPTS: usize = 4;
+
+/// Which check suite to run after a delegation. The agent loop runs `Quick`
+/// (a fast compile/typecheck) between steps and `Full` (tests + lint) only to
+/// gate completion; one-shot `scrooge cratchit` runs `Full` directly.
+#[derive(Clone, Copy)]
+enum CheckTier {
+    Quick,
+    Full,
+}
 
 /// Hard caps enforcing rule 7 (the ≤6-line report) in code: Cratchit's final
 /// message is clamped before anyone expensive reads it.
@@ -331,21 +355,22 @@ impl Orchestrator {
             ),
         ];
 
+        // Stable tool array, built once: the web-lookup budget is enforced in
+        // the handler below rather than by swapping the tool list, which would
+        // invalidate the provider's cached prefix on every transition.
+        let defs = tools::scrooge_definitions();
+
         let mut delegations = 0usize;
         let mut web_calls = 0usize;
         let mut last_report: Option<String> = None;
         let mut checks_clean: Option<bool> = None;
-        let mut done_nudges = 0usize;
+        let mut dirty = false;
+        let mut finish_attempts = 0usize;
 
         loop {
             if delegations >= self.max_steps {
                 break;
             }
-            let defs = if web_calls < SCROOGE_WEB_LOOKUPS {
-                tools::scrooge_definitions()
-            } else {
-                tools::scrooge_delegate_only()
-            };
             let msg = self
                 .client
                 .chat("scrooge", &self.sota_model, &log, &defs, None)
@@ -353,49 +378,127 @@ impl Orchestrator {
             log.push(msg.clone());
 
             let Some(calls) = msg.tool_calls.filter(|c| !c.is_empty()) else {
-                // Scrooge stopped calling tools — DONE, unless checks are red.
-                if checks_clean == Some(false) && done_nudges < 2 {
-                    done_nudges += 1;
-                    log.push(Message::text("user", SCROOGE_DONE_WITH_FAILURES));
-                    continue;
+                // Scrooge stopped calling tools — he wants to finish.
+                if let Some(out) = self
+                    .try_finish(
+                        task,
+                        &mut log,
+                        dirty,
+                        &mut checks_clean,
+                        &mut finish_attempts,
+                        delegations,
+                    )
+                    .await?
+                {
+                    return Ok(out);
                 }
-                if checks_clean == Some(true) {
-                    self.refresh_overview(task).await;
-                }
-                return Ok(Self::bill(delegations));
+                continue; // checks red — try_finish nudged Scrooge to fix them
             };
 
             for call in calls {
                 let args: Value =
                     serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
-                let result = if call.function.name == "delegate_to_cratchit" {
+                let name = call.function.name.clone();
+                let result = if name == "delegate_to_cratchit" {
                     let instructions = args["instructions"].as_str().unwrap_or("").to_string();
                     delegations += 1;
                     eprintln!("--- scrooge → cratchit (step {delegations}) ---\n{instructions}\n");
+                    // The pre-planning context was paid for once; hand it to the
+                    // first executor too instead of having it re-read the files.
+                    let ctx = if last_report.is_none() && !context.is_empty() {
+                        Some(context.as_str())
+                    } else {
+                        None
+                    };
                     let (report, verdict) = self
-                        .execute_and_verify(task, &instructions, last_report.as_deref())
+                        .execute_and_verify(
+                            task,
+                            &instructions,
+                            last_report.as_deref(),
+                            CheckTier::Quick,
+                            ctx,
+                        )
                         .await?;
                     if let Some(c) = verdict {
                         checks_clean = Some(c);
+                        dirty = true;
                     }
                     eprintln!("--- cratchit report ---\n{report}\n");
                     last_report = Some(report.clone());
                     report
+                } else if name == "web_answer" {
+                    if web_calls >= SCROOGE_WEB_LOOKUPS {
+                        "web_answer budget exhausted — decide with what you have and delegate."
+                            .to_string()
+                    } else {
+                        web_calls += 1;
+                        eprintln!(
+                            "  [scrooge] {name}({})",
+                            arg_preview(&call.function.arguments)
+                        );
+                        self.toolbox.call(&name, &args).await
+                    }
                 } else {
+                    // Free, deterministic call-graph lookups (symbol_info /
+                    // callers / callees) — answered locally, no Cratchit round.
                     eprintln!(
-                        "  [scrooge] {}({})",
-                        call.function.name,
+                        "  [scrooge] {name}({})",
                         arg_preview(&call.function.arguments)
                     );
-                    if call.function.name == "web_answer" {
-                        web_calls += 1;
-                    }
-                    self.toolbox.call(&call.function.name, &args).await
+                    self.toolbox.call(&name, &args).await
                 };
                 log.push(Message::tool_result(&call.id, result));
             }
         }
         Ok("step limit reached without DONE; review output above".into())
+    }
+
+    /// Handle Scrooge ending his turn without a tool call: decide whether the
+    /// task is really done. `Ok(Some(s))` is the final result to return from the
+    /// loop; `Ok(None)` means checks are red and Scrooge was nudged to fix them,
+    /// so the loop should continue. The full test+lint suite runs here, once, in
+    /// place of the per-step quick checks — the expensive pass is paid only at
+    /// completion, not after every delegation.
+    async fn try_finish(
+        &mut self,
+        task: &str,
+        log: &mut Vec<Message>,
+        dirty: bool,
+        checks_clean: &mut Option<bool>,
+        finish_attempts: &mut usize,
+        delegations: usize,
+    ) -> Result<Option<String>> {
+        if !dirty {
+            return Ok(Some(Self::bill(delegations))); // nothing changed to verify
+        }
+        if *checks_clean == Some(false) {
+            // Quick checks from the last step are still red.
+            if *finish_attempts < MAX_FINISH_ATTEMPTS {
+                *finish_attempts += 1;
+                log.push(Message::text("user", SCROOGE_DONE_WITH_FAILURES));
+                return Ok(None);
+            }
+            return Ok(Some("checks still failing; review the output above".into()));
+        }
+        // Quick checks are green; run the full suite once before accepting DONE.
+        let full = self.run_checks(CheckTier::Full).await?;
+        if !full.errors.is_empty() || !full.warnings.is_empty() {
+            if *finish_attempts < MAX_FINISH_ATTEMPTS {
+                *finish_attempts += 1;
+                *checks_clean = Some(false);
+                let failures = tail(&checks::render(&full), MAX_FAIL_CHARS);
+                log.push(Message::text(
+                    "user",
+                    FINISH_BLOCKED.replace("{FAILURES}", &failures),
+                ));
+                return Ok(None);
+            }
+            return Ok(Some(
+                "full checks still failing after several attempts; review output".into(),
+            ));
+        }
+        self.refresh_overview(task).await;
+        Ok(Some(Self::bill(delegations)))
     }
 
     /// Load .scrooge/overview.md, having Cratchit write it first if missing.
@@ -435,7 +538,13 @@ impl Orchestrator {
     async fn gather_context(&mut self, task: &str) -> Result<String> {
         eprintln!("--- cratchit gathering context for scrooge ---");
         let text = self
-            .cratchit_execute_with(task, CONTEXT_INSTRUCTIONS, None, Self::context_tools())
+            .cratchit_execute_with(
+                task,
+                CONTEXT_INSTRUCTIONS,
+                None,
+                None,
+                Self::context_tools(),
+            )
             .await?;
         let mut text = text.trim().to_string();
         if text.len() > MAX_CONTEXT_CHARS {
@@ -451,7 +560,7 @@ impl Orchestrator {
     /// orchestrator, not Cratchit, persist the result.
     async fn cratchit_overview(&mut self, task: &str, instructions: &str) -> Result<String> {
         let text = self
-            .cratchit_execute_with(task, instructions, None, Self::overview_tools())
+            .cratchit_execute_with(task, instructions, None, None, Self::overview_tools())
             .await?;
         Ok(text.trim().to_string())
     }
@@ -542,11 +651,13 @@ impl Orchestrator {
         task: &str,
         instructions: &str,
         prev_report: Option<&str>,
+        tier: CheckTier,
+        context: Option<&str>,
     ) -> Result<(String, Option<bool>)> {
         let before = worktree_changes(&self.toolbox.root);
         let mut report = clamp_report(
             &self
-                .cratchit_execute(task, instructions, prev_report)
+                .cratchit_execute(task, instructions, prev_report, context)
                 .await?,
         );
 
@@ -562,7 +673,7 @@ impl Orchestrator {
         let mut clean = false;
         let mut failures = String::new();
         for attempt in 0..=CHECK_RETRIES {
-            let check = self.run_checks().await?;
+            let check = self.run_checks(tier).await?;
             if check.errors.is_empty() && check.warnings.is_empty() {
                 clean = true;
                 break;
@@ -583,6 +694,7 @@ impl Orchestrator {
                         task,
                         &CHECK_FAILURE_INSTRUCTIONS.replace("{FAILURES}", &rendered),
                         Some(&prev),
+                        None,
                     )
                     .await?,
             );
@@ -610,9 +722,13 @@ impl Orchestrator {
         Ok((report, Some(clean)))
     }
 
-    async fn run_checks(&self) -> Result<checks::Report> {
+    async fn run_checks(&self, tier: CheckTier) -> Result<checks::Report> {
         let root = self.toolbox.root.clone();
-        tokio::task::spawn_blocking(move || checks::run(&root)).await?
+        tokio::task::spawn_blocking(move || match tier {
+            CheckTier::Quick => checks::run_quick(&root),
+            CheckTier::Full => checks::run(&root),
+        })
+        .await?
     }
 
     /// Dispatch a pre-planned task to Cratchit (used by MCP mode, where the
@@ -629,7 +745,9 @@ impl Orchestrator {
             self.client.usage.completion_tokens,
             self.client.usage.cost_usd,
         );
-        let (report, _) = self.execute_and_verify(task, instructions, None).await?;
+        let (report, _) = self
+            .execute_and_verify(task, instructions, None, CheckTier::Full, None)
+            .await?;
         let u = &self.client.usage;
         Ok(format!(
             "{report}\n[cratchit tokens: {} in / {} out (${:.4})]",
@@ -641,7 +759,7 @@ impl Orchestrator {
 
     /// One-shot question for the cheap model with full tool access.
     pub async fn ask(&mut self, question: &str) -> Result<String> {
-        self.cratchit_execute(question, ASK_INSTRUCTIONS, None)
+        self.cratchit_execute(question, ASK_INSTRUCTIONS, None, None)
             .await
     }
 
@@ -736,8 +854,9 @@ impl Orchestrator {
         task: &str,
         plan: &str,
         prev_report: Option<&str>,
+        context: Option<&str>,
     ) -> Result<String> {
-        self.cratchit_execute_with(task, plan, prev_report, tools::definitions())
+        self.cratchit_execute_with(task, plan, prev_report, context, tools::definitions())
             .await
     }
 
@@ -750,16 +869,17 @@ impl Orchestrator {
         task: &str,
         plan: &str,
         prev_report: Option<&str>,
+        context: Option<&str>,
         defs: Vec<Value>,
     ) -> Result<String> {
         // Inject context deterministically instead of having the model fetch
         // it: the code map sliced to what the plan mentions, the full
         // best-practice sections relevant to task + plan, and the previous
         // round's report so already-paid-for findings aren't re-investigated.
-        let context = format!("{task} {plan}");
+        let slice_text = format!("{task} {plan}");
         let full_map = codemap::build_cached(&self.toolbox.root)?;
-        let map = full_map.brief_for(&context);
-        let guidance = practices::relevant_sections(&context, &full_map.languages());
+        let map = full_map.brief_for(&slice_text);
+        let guidance = practices::relevant_sections(&slice_text, &full_map.languages());
         // Loaded, never generated, here — ensure_overview() itself runs
         // through cratchit_execute, so generating would recurse.
         let overview = crate::overview::load(&self.toolbox.root)
@@ -767,6 +887,13 @@ impl Orchestrator {
             .unwrap_or_default();
         let prev = prev_report
             .map(|r| format!("\nPREVIOUS ROUND REPORT (already verified facts):\n{r}\n"))
+            .unwrap_or_default();
+        // Reconnaissance gathered before planning, handed to the first executor
+        // so it doesn't re-read the same files (empty on later steps, where the
+        // previous report carries the chain forward instead).
+        let ctx = context
+            .filter(|c| !c.trim().is_empty())
+            .map(|c| format!("PRE-PLANNING CONTEXT (facts gathered before planning):\n{c}\n"))
             .unwrap_or_default();
         let mut log = vec![
             Message::text("system", CRATCHIT_SYSTEM),
@@ -778,6 +905,7 @@ impl Orchestrator {
                     .replace("{OVERVIEW}", &overview)
                     .replace("{PLAN}", plan)
                     .replace("{PREV}", &prev)
+                    .replace("{CONTEXT}", &ctx)
                     .replace("{MAP}", &map)
                     .replace("{GUIDANCE}", &guidance),
             ),

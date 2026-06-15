@@ -11,11 +11,18 @@ use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::codemap;
+
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct LangChecks {
     /// Applied silently before anything else; never blocks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
+    /// Fast, error-only compile/typecheck run between delegations in the agent
+    /// loop (e.g. `cargo check`). Far cheaper than the full `test` suite, which
+    /// only runs once at task completion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quick: Option<String>,
     /// Build + tests. Non-zero exit = errors, fed back to Scrooge.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub test: Option<String>,
@@ -35,6 +42,11 @@ pub struct Report {
 }
 
 const MAX_OUTPUT_CHARS: usize = 3000;
+
+/// Source files longer than this are reported as a warning so they get split
+/// into smaller modules. Matches `MAX_WHOLE_FILE_LINES` in `tools.rs`, so a
+/// file kept under the limit is also readable whole by the agent.
+const MAX_FILE_LINES: usize = 2000;
 
 pub fn config_path(root: &Path) -> PathBuf {
     root.join(".scrooge").join("checks.toml")
@@ -72,6 +84,7 @@ fn defaults(root: &Path) -> BTreeMap<String, LangChecks> {
             "rust".into(),
             LangChecks {
                 format: Some("cargo fmt".into()),
+                quick: Some("cargo check --quiet".into()),
                 test: Some("cargo test --quiet".into()),
                 // Autofix with the *same* lint set as the reporting step, so
                 // every machine-applicable pedantic/nursery suggestion is
@@ -92,6 +105,9 @@ fn defaults(root: &Path) -> BTreeMap<String, LangChecks> {
             "python".into(),
             LangChecks {
                 format: Some("ruff format .".into()),
+                // Critical-error subset (syntax, undefined names) — the classic
+                // flake8 "stop the build" codes; excludes the venv by default.
+                quick: Some("ruff check --quiet --select E9,F63,F7,F82 .".into()),
                 test: Some("pytest -q".into()),
                 lint_fix: Some(format!("ruff check --fix --quiet --select {RUFF_RULES} .")),
                 lint: Some(format!("ruff check --select {RUFF_RULES} .")),
@@ -105,6 +121,9 @@ fn defaults(root: &Path) -> BTreeMap<String, LangChecks> {
             "javascript".into(),
             LangChecks {
                 format: Some("npx --no-install biome format --write .".into()),
+                // No cheap standalone typecheck for plain JS; rely on the full
+                // suite at task end. Set this to `tsc --noEmit` for a TS project.
+                quick: None,
                 test: Some("npm test --silent".into()),
                 lint_fix: Some("npx --no-install biome check --write . 2>/dev/null || true".into()),
                 lint: Some("npx --no-install biome check .".into()),
@@ -166,6 +185,50 @@ fn truncate(s: &str) -> String {
     format!("[... truncated ...]\n{}", &s[start..])
 }
 
+/// Fast per-step verification for the agent loop: format, then each language's
+/// `quick` compile/typecheck. Errors only — the heavy test+lint pass is saved
+/// for `run` at task completion, so a multi-step task doesn't pay the full
+/// suite after every delegation.
+pub fn run_quick(root: &Path) -> Result<Report> {
+    let cfg = load(root)?;
+    let mut report = Report {
+        errors: Vec::new(),
+        warnings: Vec::new(),
+    };
+    for (lang, checks) in &cfg {
+        if let Some(cmd) = &checks.format {
+            run_cmd(root, cmd);
+        }
+        if let Some(cmd) = &checks.quick {
+            let (ok, out) = run_cmd(root, cmd);
+            if !ok {
+                report.errors.push((lang.clone(), truncate(&out)));
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// Source files exceeding `MAX_FILE_LINES`, as `(relative path, line count)`.
+/// Uses the same source-file walk as the code map, so vendored/build dirs are
+/// skipped and only indexable languages count.
+fn long_files(root: &Path) -> Vec<(String, usize)> {
+    let mut out = Vec::new();
+    for entry in codemap::source_files(root) {
+        let Ok(content) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let lines = content.lines().count();
+        if lines > MAX_FILE_LINES {
+            let path = entry.path();
+            let rel = path.strip_prefix(root).unwrap_or(path);
+            out.push((rel.display().to_string(), lines));
+        }
+    }
+    out.sort_by(|a, b| b.1.cmp(&a.1));
+    out
+}
+
 /// Format everything, then run tests; only if all tests pass, autofix and
 /// report lint warnings (warnings are pointless noise while the build is red).
 pub fn run(root: &Path) -> Result<Report> {
@@ -198,6 +261,19 @@ pub fn run(root: &Path) -> Result<Report> {
                 report.warnings.push((lang.clone(), truncate(&out)));
             }
         }
+    }
+    // File-length lint: nudge oversized files toward being split up.
+    let long = long_files(root);
+    if !long.is_empty() {
+        let body = long
+            .iter()
+            .map(|(p, n)| format!("{p}: {n} lines"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        report.warnings.push((
+            "structure".into(),
+            format!("files over {MAX_FILE_LINES} lines — split into smaller modules:\n{body}"),
+        ));
     }
     Ok(report)
 }
