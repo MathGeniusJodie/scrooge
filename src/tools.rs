@@ -63,7 +63,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "edit_file",
-            "Apply one or more find/replace edits to a file in order, all-or-nothing. Each find must match exactly once (whitespace-tolerant fallback) unless its replace_all is true. Returns applied line numbers and a syntax verdict — no need to re-read.",
+            "Apply one or more find/replace edits to a file in order, all-or-nothing — batch related edits into ONE call rather than issuing several. Each find must match exactly once (whitespace-tolerant fallback) unless its replace_all is true. Returns applied line numbers and a syntax verdict — no need to re-read.",
             &obj(
                 &json!({
                     "path": {"type": "string"},
@@ -85,7 +85,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "replace_symbol",
-            "Replace an entire function/method/struct by its code-map name with new source — no find string needed, the span comes from the parser. Returns a syntax verdict. Optional path narrows when the name is ambiguous.",
+            "Replace an entire function/method/struct by its code-map name with new source — prefer this over edit_file when rewriting a whole definition; no find string needed, the span comes from the parser. Returns a syntax verdict. Optional path narrows when the name is ambiguous.",
             &obj(
                 &json!({
                     "name": {"type": "string", "description": "symbol name from the code map, e.g. 'parse' or 'Client.chat'"},
@@ -102,22 +102,22 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "python",
-            "Run Python code; use for ALL math, counting and data transformation — never compute in your head. Prints stdout.",
+            "Run Python code; use for ALL math, counting, logic and data transformation — never work a result out in your head. Prints stdout.",
             &obj(&json!({"code": {"type": "string"}}), &["code"]),
         ),
         tool(
             "wolfram",
-            "WolframScript for symbolic math, calculus, equation solving.",
+            "WolframScript for symbolic math, calculus, equation solving — never work these out by hand.",
             &obj(&json!({"expression": {"type": "string"}}), &["expression"]),
         ),
         tool(
             "symbol_info",
-            "Signature, location, callers and callees of a symbol.",
+            "Signature, location, callers and callees of a symbol. Check it before changing any signature, to see the change's blast radius.",
             &obj(&json!({"name": {"type": "string"}}), &["name"]),
         ),
         tool(
             "callers",
-            "Functions that call the named function.",
+            "Functions that call the named function — check before changing its signature.",
             &obj(&json!({"name": {"type": "string"}}), &["name"]),
         ),
         tool(
@@ -143,7 +143,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "search_libraries",
-            "Web-search for the best external library for a need; call before add_dependency when choosing a library — do not pick from memory.",
+            "Web-search for the best external library for a need — use it whenever a task needs a library and none was named. Call before add_dependency",
             &obj(
                 &json!({"query": {"type": "string", "description": "what you need, e.g. 'rust crate for parsing TOML'"}}),
                 &["query"],
@@ -170,11 +170,13 @@ pub fn scrooge_definitions() -> Vec<Value> {
         tool(
             "delegate_to_cratchit",
             "Dispatch one step to Cratchit for execution. Cratchit has full tool access \
-             (files, shell, python, wolfram, docs, call graph). Instructions must be \
-             standalone and imperative, naming exact files/symbols. A step that changes \
-             code returns a report ending with a CHECKS verdict — trust it over Cratchit's \
-             claims; a read-only step returns just his findings. \
-             Call ONCE per turn; wait for the report before issuing the next step.",
+             (files, shell, python, wolfram, docs, call graph); when you need file-level \
+             facts before planning a \
+             change, spend one call purely to investigate — tell him to read the relevant \
+             files and report, changing nothing. Instructions must be standalone and \
+             imperative, naming exact files/symbols. A step that changes code returns a \
+             report ending with a CHECKS verdict (a fast per-step compile \
+             check). Call ONCE per turn.",
             &obj(
                 &json!({"instructions": {"type": "string", "description": "standalone imperative step for Cratchit to execute and verify"}}),
                 &["instructions"],
@@ -197,7 +199,7 @@ pub fn scrooge_definitions() -> Vec<Value> {
         ),
         tool(
             "web_answer",
-            "Get one concise AI-summarized answer from the web (Brave summarizer, not a link list). Use SPARINGLY — only to settle a library/dependency choice or a specific API/implementation detail you are unsure of. Not for code in this repo (you already have the brief).",
+            "Get one concise AI-summarized answer from the web (Brave summarizer, not a link list). Use SPARINGLY — only to settle a library/dependency choice or a specific API/implementation detail you are unsure of; most tasks need zero calls. Not for code in this repo (you already have the brief).",
             &obj(
                 &json!({"query": {"type": "string", "description": "a focused question, e.g. 'best maintained rust crate for TOML parsing 2026' or 'does tokio::fs::read_to_string exist'"}}),
                 &["query"],
