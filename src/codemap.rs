@@ -268,10 +268,38 @@ fn text<'a>(node: Node, bytes: &'a [u8]) -> &'a str {
     node.utf8_text(bytes).unwrap_or("")
 }
 
-fn first_line(s: &str) -> String {
-    let line = s.lines().next().unwrap_or("").trim();
-    let line = line.trim_end_matches('{').trim_end_matches(':').trim();
-    line.to_string()
+/// The signature of a definition, with a multi-line parameter list (or `where`
+/// clause) collapsed onto one line — so a wrapped `fn foo(\n  a: T,\n  b: U\n)`
+/// isn't truncated to `fn foo(`. The body is dropped at its opening delimiter:
+/// `{` for brace languages, the top-level `:` for Python (skipping the colons
+/// inside `x: T` parameters and `[...]` annotations).
+fn first_line(s: &str, lang: &Lang) -> String {
+    let sig: String = match lang {
+        Lang::Python => {
+            let mut depth = 0i32;
+            let mut out = String::new();
+            for ch in s.chars() {
+                match ch {
+                    '(' | '[' | '{' => depth += 1,
+                    ')' | ']' | '}' => depth -= 1,
+                    ':' if depth == 0 => break,
+                    _ => {}
+                }
+                out.push(ch);
+            }
+            out
+        }
+        _ => s.split('{').next().unwrap_or(s).to_string(),
+    };
+    // Collapse runs of whitespace to single spaces without an intermediate Vec
+    // (this runs once per symbol during the code-map build).
+    sig.split_whitespace().fold(String::new(), |mut acc, w| {
+        if !acc.is_empty() {
+            acc.push(' ');
+        }
+        acc.push_str(w);
+        acc
+    })
 }
 
 fn name_of(node: Node, bytes: &[u8]) -> Option<String> {
@@ -341,7 +369,7 @@ fn walk(
         map.symbols.push(Symbol {
             name: qualified.clone(),
             kind: skind,
-            signature: first_line(text(node, bytes)),
+            signature: first_line(text(node, bytes), lang),
             file: rel.to_path_buf(),
             line: node.start_position().row + 1,
             end_line: node.end_position().row + 1,
@@ -358,7 +386,7 @@ fn walk(
         map.symbols.push(Symbol {
             name: name.clone(),
             kind: SymbolKind::Function,
-            signature: first_line(text(node, bytes)),
+            signature: first_line(text(node, bytes), lang),
             file: rel.to_path_buf(),
             line: node.start_position().row + 1,
             end_line: node.end_position().row + 1,

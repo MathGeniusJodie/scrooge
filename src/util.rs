@@ -3,6 +3,21 @@
 //! of being re-derived in tools.rs, checks.rs and agents.rs.
 
 use serde_json::Value;
+use std::path::PathBuf;
+
+/// A process-unique path under the system temp dir: `<prefix>-<pid>-<seq>`,
+/// where `seq` is a global monotonic counter. Used for scratch git indexes /
+/// object stores and per-test sandbox roots — anywhere two concurrent callers
+/// must not collide on a temp path.
+pub fn unique_temp_path(prefix: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "{prefix}-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ))
+}
 
 /// Largest char boundary <= `i`, so byte-budget truncation never splits a
 /// multibyte UTF-8 sequence (tool output and reports are full of `—`, `’`, …).

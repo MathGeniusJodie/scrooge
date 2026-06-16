@@ -180,12 +180,8 @@ fn run_cmd(root: &Path, cmd: &str) -> (bool, String) {
     // Confine the check command the same way Cratchit's `shell` tool is: these
     // run test code and lint autofixes (often just-written, untrusted), so they
     // get the same read-anywhere / write-under-root Landlock policy.
-    let sandbox_root = root.to_path_buf();
     unsafe {
-        command.pre_exec(move || {
-            let _ = crate::sandbox::confine(&sandbox_root);
-            Ok(())
-        });
+        command.pre_exec(crate::sandbox::confiner(root));
     }
     let out = command.output();
     match out {

@@ -238,21 +238,41 @@ fn fuzzy_match_ranges(content: &str, find: &str) -> Vec<(usize, usize)> {
     if needle.is_empty() {
         return vec![];
     }
-    let mut starts = vec![0usize];
-    for (i, b) in content.bytes().enumerate() {
+    // (start_byte, content_end_byte) for each line, derived purely from the raw
+    // bytes — `str::lines` strips a trailing `\r`, so deriving the end offset
+    // from `lines[k].len()` would land one byte early on a CRLF file and splice
+    // mid-`\r`. Tracking it here keeps the offsets honest for either ending.
+    let bytes = content.as_bytes();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
         if b == b'\n' {
-            starts.push(i + 1);
+            let end = if i > start && bytes[i - 1] == b'\r' {
+                i - 1
+            } else {
+                i
+            };
+            spans.push((start, end));
+            start = i + 1;
         }
     }
-    let lines: Vec<&str> = content.lines().collect();
+    // Final line with no trailing newline.
+    if start < bytes.len() {
+        spans.push((start, bytes.len()));
+    }
+    // Each span's [start, content_end) slice is the line minus its ending, so
+    // it stands in for `content.lines()` without a second pass/allocation.
     let mut out = Vec::new();
-    if lines.len() < needle.len() {
+    if spans.len() < needle.len() {
         return out;
     }
-    for i in 0..=lines.len() - needle.len() {
-        if (0..needle.len()).all(|j| lines[i + j].trim() == needle[j]) {
+    for i in 0..=spans.len() - needle.len() {
+        if (0..needle.len()).all(|j| {
+            let (s, e) = spans[i + j];
+            content[s..e].trim() == needle[j]
+        }) {
             let last = i + needle.len() - 1;
-            out.push((starts[i], starts[last] + lines[last].len()));
+            out.push((spans[i].0, spans[last].1));
         }
     }
     out
@@ -685,15 +705,11 @@ impl Toolbox {
     async fn run(&self, prog: &str, args: &[&str]) -> Result<String> {
         let mut cmd = Command::new(prog);
         cmd.args(args).current_dir(&self.root);
-        let sandbox_root = self.root.clone();
-        // Confine the child: read anywhere, write only inside the project
-        // root plus /tmp and package-manager caches. Best-effort — on a
-        // kernel without Landlock the command still runs.
+        // Confine the child: write only inside the project root plus /tmp and
+        // package-manager caches. The ruleset is built here, in the parent; the
+        // pre_exec closure only makes the allocation-free restrict_self syscall.
         unsafe {
-            cmd.pre_exec(move || {
-                let _ = crate::sandbox::confine(&sandbox_root);
-                Ok(())
-            });
+            cmd.pre_exec(crate::sandbox::confiner(&self.root));
         }
         let out = tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output())
             .await
@@ -938,7 +954,11 @@ mod tests {
     use super::*;
 
     fn toolbox() -> Toolbox {
-        let root = std::env::temp_dir().join(format!("scrooge-sbx-{}", std::process::id()));
+        // A fresh root per call: tests run concurrently on the multi-threaded
+        // runtime and share the process-global code-map cache (keyed by root),
+        // so a shared directory would let one test's fixtures perturb another's
+        // cache key mid-build. A unique root isolates them completely.
+        let root = crate::util::unique_temp_path("scrooge-sbx");
         std::fs::create_dir_all(&root).unwrap();
         Toolbox::new(root)
     }
@@ -1044,9 +1064,6 @@ mod tests {
     #[tokio::test]
     async fn read_symbol_returns_just_the_definition() {
         let tb = toolbox();
-        // Unique name: the test toolbox shares one root + cached code map
-        // across tests, so a duplicated symbol name would collide with another
-        // test's fixture.
         std::fs::write(
             tb.root.join("rd.rs"),
             "fn rd_keep() {\n    1;\n}\n\nfn rd_target() {\n    work();\n}\n",
@@ -1094,6 +1111,19 @@ mod tests {
         let (a, b) = ranges[0];
         assert_eq!(&content[a..b], "    let x = 1;\n    let y = 2;");
         assert!(fuzzy_match_ranges(content, "let z = 3;").is_empty());
+    }
+
+    #[test]
+    fn fuzzy_match_offsets_survive_crlf() {
+        // CRLF line endings: `str::lines` strips the `\r`, so the byte offsets
+        // must come from the raw bytes or they land one byte early per line.
+        let content = "fn a() {\r\n    let x = 1;\r\n    let y = 2;\r\n}\r\n";
+        let find = "let x = 1;\nlet y = 2;";
+        let ranges = fuzzy_match_ranges(content, find);
+        assert_eq!(ranges.len(), 1);
+        let (a, b) = ranges[0];
+        // The matched slice is exact (no stray `\r`), so a replace splices cleanly.
+        assert_eq!(&content[a..b], "    let x = 1;\r\n    let y = 2;");
     }
 
     #[tokio::test]

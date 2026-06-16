@@ -60,29 +60,31 @@ pub(super) fn worktree_changes(root: &Path) -> Option<String> {
 /// that is then modified is caught too — so a real change is never mistaken for
 /// a read-only step. None when the root is not a git repo (or git is missing).
 pub(super) fn worktree_fingerprint(root: &Path) -> Option<String> {
-    use std::sync::atomic::{AtomicU64, Ordering};
     // Unique per call so concurrent orchestrators (e.g. parallel tests) never
-    // share a temp index and corrupt each other's snapshot.
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let index = std::env::temp_dir().join(format!(
-        "scrooge-index-{}-{}",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
+    // share a temp index/object store and corrupt each other's snapshot.
+    let index = crate::util::unique_temp_path("scrooge-index");
+    // Throwaway object store too: `add -A` + `write-tree` write a blob for every
+    // file plus the trees, and pointing them at a temp dir keeps that churn out
+    // of the repo's real .git/objects (which is otherwise reclaimed only by gc).
+    // The fingerprint is the tree OID printed to stdout; the objects themselves
+    // are never needed again, so the whole dir is discarded below.
+    let objects = crate::util::unique_temp_path("scrooge-objs");
     let _ = std::fs::remove_file(&index);
+    let _ = std::fs::create_dir_all(&objects);
     let git = |args: &[&str]| {
         std::process::Command::new("git")
             .args(args)
             .current_dir(root)
             .env("GIT_INDEX_FILE", &index)
+            .env("GIT_OBJECT_DIRECTORY", &objects)
             .output()
             .ok()
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
     };
     // Stage the whole worktree into the scratch index, then hash it to a tree.
-    git(&["add", "-A"])?;
-    let tree = git(&["write-tree"]);
+    let tree = git(&["add", "-A"]).and_then(|_| git(&["write-tree"]));
     let _ = std::fs::remove_file(&index);
+    let _ = std::fs::remove_dir_all(&objects);
     tree
 }

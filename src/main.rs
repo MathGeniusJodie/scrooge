@@ -88,6 +88,23 @@ enum Cmd {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let root = cli.root.canonicalize()?;
+    // Every command that spawns untrusted code (Cratchit's shell/python, the
+    // check suite) is gated on an enforced sandbox; the read-only map/graph
+    // commands are not. One guard here keeps the list in a single place instead
+    // of sprinkling the call across arms.
+    if matches!(
+        cli.cmd,
+        Cmd::Run { .. }
+            | Cmd::Cratchit { .. }
+            | Cmd::Ask { .. }
+            | Cmd::McpServe
+            | Cmd::RefreshOverview { .. }
+            | Cmd::Check
+            | Cmd::Humbugs
+            | Cmd::Helpers { validate: true, .. }
+    ) {
+        sandbox::preflight();
+    }
     match cli.cmd {
         Cmd::Map => print!("{}", codemap::build(&root)?.brief()),
         Cmd::Sym { name } => print!("{}", codemap::build(&root)?.detail(&name)),

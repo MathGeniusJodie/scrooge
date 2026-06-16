@@ -120,10 +120,16 @@ impl Server {
                     }
                     // Incomplete trailing value: keep it buffered for more bytes.
                     Some(Err(e)) if e.is_eof() => break,
-                    // Malformed value: drop what's buffered and resync on the
-                    // next read rather than spinning on the same bad bytes.
+                    // Malformed value: skip past just this value — to the next
+                    // newline (the server frames its own output that way) — so
+                    // any well-formed messages buffered after it still parse,
+                    // rather than dropping the whole buffer.
                     Some(Err(_)) => {
-                        consumed = buf.len();
+                        let off = stream.byte_offset();
+                        consumed = buf[off..]
+                            .iter()
+                            .position(|&b| b == b'\n')
+                            .map_or(buf.len(), |i| off + i + 1);
                         break;
                     }
                     None => break,
