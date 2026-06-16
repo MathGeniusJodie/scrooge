@@ -406,56 +406,59 @@ impl Toolbox {
         )
     }
 
+    fn read_file(&self, args: &Value) -> Result<String> {
+        let s = |k: &str| crate::util::str_arg(args, k);
+        let path = self.resolve(&s("path"));
+        let content = std::fs::read_to_string(&path)?;
+        let end = args["end_line"].as_u64().map(|n| n as usize);
+        // A bare end_line (no start) reads from line 1 rather than
+        // silently falling through to a whole-file read.
+        let start = args["start_line"]
+            .as_u64()
+            .map(|n| n as usize)
+            .or_else(|| end.map(|_| 1));
+        Ok(if let (Some(a), b) = (start, end) {
+            // Cap range size too, or 1..999999 would bypass the
+            // whole-file guard below.
+            let wanted = b.unwrap_or(usize::MAX);
+            let capped = wanted.min(a.saturating_add(MAX_RANGE_LINES - 1));
+            // Lines are returned unnumbered, matching a whole-file read.
+            let mut out = content
+                .lines()
+                .enumerate()
+                .filter(|(i, _)| *i + 1 >= a && *i < capped)
+                .map(|(_, l)| l)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let total = content.lines().count();
+            if out.is_empty() {
+                out = format!(
+                    "no lines in range {a}-{} — file has {total} lines",
+                    if wanted == usize::MAX { total } else { wanted }
+                );
+            } else if capped < wanted && capped < total {
+                write!(
+                    out,
+                    "\n[range clamped to {MAX_RANGE_LINES} lines; \
+                     request another range to continue]"
+                )
+                .unwrap();
+            }
+            out
+        } else {
+            let total = content.lines().count();
+            if total > MAX_WHOLE_FILE_LINES {
+                self.file_outline(&path, total)?
+            } else {
+                content
+            }
+        })
+    }
+
     async fn dispatch(&self, name: &str, args: &Value) -> Result<String> {
         let s = |k: &str| crate::util::str_arg(args, k);
         match name {
-            "read_file" => {
-                let path = self.resolve(&s("path"));
-                let content = std::fs::read_to_string(&path)?;
-                let end = args["end_line"].as_u64().map(|n| n as usize);
-                // A bare end_line (no start) reads from line 1 rather than
-                // silently falling through to a whole-file read.
-                let start = args["start_line"]
-                    .as_u64()
-                    .map(|n| n as usize)
-                    .or_else(|| end.map(|_| 1));
-                Ok(if let (Some(a), b) = (start, end) {
-                    // Cap range size too, or 1..999999 would bypass the
-                    // whole-file guard below.
-                    let wanted = b.unwrap_or(usize::MAX);
-                    let capped = wanted.min(a.saturating_add(MAX_RANGE_LINES - 1));
-                    // Lines are returned unnumbered, matching a whole-file read.
-                    let mut out = content
-                        .lines()
-                        .enumerate()
-                        .filter(|(i, _)| *i + 1 >= a && *i < capped)
-                        .map(|(_, l)| l)
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    let total = content.lines().count();
-                    if out.is_empty() {
-                        out = format!(
-                            "no lines in range {a}-{} — file has {total} lines",
-                            if wanted == usize::MAX { total } else { wanted }
-                        );
-                    } else if capped < wanted && capped < total {
-                        write!(
-                            out,
-                            "\n[range clamped to {MAX_RANGE_LINES} lines; \
-                             request another range to continue]"
-                        )
-                        .unwrap();
-                    }
-                    out
-                } else {
-                    let total = content.lines().count();
-                    if total > MAX_WHOLE_FILE_LINES {
-                        self.file_outline(&path, total)?
-                    } else {
-                        content
-                    }
-                })
-            }
+            "read_file" => self.read_file(args),
             "write_file" => {
                 let path = self.resolve_write(&s("path"))?;
                 if let Some(dir) = path.parent() {

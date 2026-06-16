@@ -20,3 +20,5 @@ regex = "1"
 toml = "0.8"
 chrono = "0.4.45"
 landlock = "0.4.5"
+complexity = "0.2.0"
+syn = { version = "1", features = ["full", "visit", "extra-traits"] }

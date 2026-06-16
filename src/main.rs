@@ -2,6 +2,7 @@ mod accounting;
 mod agents;
 mod checks;
 mod codemap;
+mod complexity;
 mod helpers;
 mod mcp;
 mod openrouter;
@@ -45,6 +46,13 @@ enum Cmd {
     Ask { question: String },
     /// Print the compact codebase brief (no LLM, free).
     Map,
+    /// Rank every Rust function by cognitive complexity, hottest first (no
+    /// LLM, free). Shows the top 10 by default.
+    Complexity {
+        /// How many to show; 0 shows all.
+        #[arg(long, default_value_t = 10)]
+        top: usize,
+    },
     /// Show signature, callers and callees of a symbol (no LLM, free).
     Sym { name: String },
     /// List callers of a function (no LLM, free).
@@ -107,6 +115,11 @@ async fn main() -> Result<()> {
     }
     match cli.cmd {
         Cmd::Map => print!("{}", codemap::build(&root)?.brief()),
+        Cmd::Complexity { top } => {
+            let funcs = complexity::report(&root);
+            let limit = if top == 0 { funcs.len() } else { top };
+            print!("{}", complexity::render(&funcs, limit));
+        }
         Cmd::Sym { name } => print!("{}", codemap::build(&root)?.detail(&name)),
         Cmd::Callers { name } => {
             println!("{}", codemap::build(&root)?.callers_of(&name).join("\n"));
