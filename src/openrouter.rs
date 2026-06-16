@@ -179,15 +179,19 @@ impl Chat for Client {
             tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
         };
         if let Some(u) = v.get("usage") {
-            let (p, c) = (
-                u["prompt_tokens"].as_u64().unwrap_or(0),
-                u["completion_tokens"].as_u64().unwrap_or(0),
-            );
-            let cost = u["cost"].as_f64().unwrap_or(0.0);
-            self.usage.prompt_tokens += p;
-            self.usage.completion_tokens += c;
-            self.usage.cost_usd += cost;
-            accounting::record(&self.root, agent, model, p, c, cost, &body, &v);
+            let turn = accounting::Turn {
+                agent,
+                model,
+                prompt_tokens: u["prompt_tokens"].as_u64().unwrap_or(0),
+                completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
+                cost_usd: u["cost"].as_f64().unwrap_or(0.0),
+                request: &body,
+                response: &v,
+            };
+            self.usage.prompt_tokens += turn.prompt_tokens;
+            self.usage.completion_tokens += turn.completion_tokens;
+            self.usage.cost_usd += turn.cost_usd;
+            accounting::record(&self.root, &turn);
         }
         self.last_finish_reason = v["choices"][0]["finish_reason"]
             .as_str()

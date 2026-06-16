@@ -72,7 +72,9 @@ fn prompt_text(request: &Value) -> String {
 /// shared by `record` (cumulative totals) and `shillings_saved` (per-request).
 #[allow(clippy::cast_precision_loss)]
 fn scrooge_cost(rates: &Rates, prompt: f64, completion: f64) -> f64 {
-    prompt * rates.scrooge_usd_per_mtok_in / 1e6 + completion * rates.scrooge_usd_per_mtok_out / 1e6
+    const MILLION: f64 = 1e6;
+    prompt * rates.scrooge_usd_per_mtok_in / MILLION
+        + completion * rates.scrooge_usd_per_mtok_out / MILLION
 }
 
 /// The model's text output, ignoring any tool calls it requested.
@@ -83,18 +85,28 @@ fn output_text(response: &Value) -> String {
         .to_string()
 }
 
-#[allow(clippy::too_many_arguments)]
+/// One completed LLM API round-trip, bundling everything needed for bookkeeping.
+pub struct Turn<'a> {
+    pub agent: &'a str,
+    pub model: &'a str,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub cost_usd: f64,
+    pub request: &'a Value,
+    pub response: &'a Value,
+}
+
 #[allow(clippy::cast_precision_loss)]
-pub fn record(
-    root: &Path,
-    agent: &str,
-    model: &str,
-    prompt: u64,
-    completion: u64,
-    cost_usd: f64,
-    request: &Value,
-    response: &Value,
-) {
+pub fn record(root: &Path, turn: &Turn) {
+    let Turn {
+        agent,
+        model,
+        prompt_tokens,
+        completion_tokens,
+        cost_usd,
+        request,
+        response,
+    } = turn;
     let dir = root.join(".scrooge");
     let _ = std::fs::create_dir_all(&dir);
 
@@ -106,7 +118,7 @@ pub fn record(
     {
         let _ = writeln!(
             f,
-            "=== {ts} {agent} {model} prompt={prompt} completion={completion} cost=${cost_usd:.6} ===\n\
+            "=== {ts} {agent} {model} prompt={prompt_tokens} completion={completion_tokens} cost=${cost_usd:.6} ===\n\
              >>> prompt\n{}\n<<< output\n{}",
             prompt_text(request),
             output_text(response)
@@ -122,7 +134,10 @@ pub fn record(
     if entry.is_null() {
         *entry = json!({"prompt_tokens": 0, "completion_tokens": 0});
     }
-    for (key, add) in [("prompt_tokens", prompt), ("completion_tokens", completion)] {
+    for (key, add) in [
+        ("prompt_tokens", *prompt_tokens),
+        ("completion_tokens", *completion_tokens),
+    ] {
         entry[key] = json!(entry[key].as_u64().unwrap_or(0) + add);
     }
     entry["cost_usd"] = json!(entry["cost_usd"].as_f64().unwrap_or(0.0) + cost_usd);
@@ -131,7 +146,7 @@ pub fn record(
     // .scrooge/rates.toml) less what they actually cost. Only meaningful for
     // Cratchit — for Scrooge it would value the model against itself, so the
     // field is left off his ledger entry entirely.
-    if agent == "cratchit" {
+    if *agent == "cratchit" {
         let rates = load_rates(&dir);
         let p = entry["prompt_tokens"].as_u64().unwrap_or(0) as f64;
         let c = entry["completion_tokens"].as_u64().unwrap_or(0) as f64;
@@ -161,9 +176,18 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let req = serde_json::json!({"messages": [{"role": "user", "content": "fix the bug"}]});
         let resp = serde_json::json!({"choices": [{"message": {"content": "done"}}]});
-        super::record(&dir, "cratchit", "m", 100, 10, 0.001, &req, &resp);
-        super::record(&dir, "cratchit", "m", 50, 5, 0.002, &req, &resp);
-        super::record(&dir, "scrooge", "m", 7, 3, 0.05, &req, &resp);
+        let turn = |agent, prompt_tokens, completion_tokens, cost_usd| super::Turn {
+            agent,
+            model: "m",
+            prompt_tokens,
+            completion_tokens,
+            cost_usd,
+            request: &req,
+            response: &resp,
+        };
+        super::record(&dir, &turn("cratchit", 100, 10, 0.001));
+        super::record(&dir, &turn("cratchit", 50, 5, 0.002));
+        super::record(&dir, &turn("scrooge", 7, 3, 0.05));
         let scrooge_dir = dir.join(".scrooge");
         let ledger: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(scrooge_dir.join("ledger.json")).unwrap(),
