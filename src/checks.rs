@@ -111,7 +111,12 @@ fn defaults(root: &Path) -> BTreeMap<String, LangChecks> {
                 // flake8 "stop the build" codes; excludes the venv by default.
                 quick: Some("ruff check --quiet --select E9,F63,F7,F82 .".into()),
                 test: Some("pytest -q".into()),
-                lint_fix: Some(format!("ruff check --fix --quiet --select {RUFF_RULES} .")),
+                // `--unsafe-fixes` also applies ruff's behavior-changing fixes
+                // (e.g. `== None` → `is None`). Worth the broader cleanup on
+                // legacy code; the post-fix re-test in `run` catches regressions.
+                lint_fix: Some(format!(
+                    "ruff check --fix --unsafe-fixes --quiet --select {RUFF_RULES} ."
+                )),
                 lint: Some(format!("ruff check --select {RUFF_RULES} .")),
             },
         );
@@ -127,7 +132,11 @@ fn defaults(root: &Path) -> BTreeMap<String, LangChecks> {
                 // suite at task end. Set this to `tsc --noEmit` for a TS project.
                 quick: None,
                 test: Some("npm test --silent".into()),
-                lint_fix: Some("npx --no-install biome check --write . 2>/dev/null || true".into()),
+                // `--unsafe` lets biome apply its behavior-changing fixes too;
+                // the post-fix re-test in `run` guards against regressions.
+                lint_fix: Some(
+                    "npx --no-install biome check --write --unsafe . 2>/dev/null || true".into(),
+                ),
                 lint: Some("npx --no-install biome check .".into()),
             },
         );
@@ -259,10 +268,34 @@ pub fn run(root: &Path) -> Result<Report> {
     if !report.errors.is_empty() {
         return Ok(report);
     }
-    for (lang, checks) in &cfg {
+    for checks in cfg.values() {
         if let Some(cmd) = &checks.lint_fix {
             run_cmd(root, cmd);
         }
+    }
+    // Autofixes (now including ruff/biome's *unsafe* tier) can change behavior,
+    // so re-run the suite after applying them. A break that surfaces here was
+    // introduced by the autofix, not the agent's edit — report it as an error
+    // (the fix is left in the tree for the agent to inspect or undo).
+    for (lang, checks) in &cfg {
+        if let Some(cmd) = &checks.test {
+            let (ok, out) = run_cmd(root, cmd);
+            if !ok {
+                report.errors.push((
+                    lang.clone(),
+                    format!(
+                        "tests passed before lint autofix but FAILED after — the autofix \
+                         likely broke something:\n{}",
+                        util::tail(&out, MAX_OUTPUT_CHARS)
+                    ),
+                ));
+            }
+        }
+    }
+    if !report.errors.is_empty() {
+        return Ok(report);
+    }
+    for (lang, checks) in &cfg {
         if let Some(cmd) = &checks.lint {
             let (ok, out) = run_cmd(root, cmd);
             if !ok {
