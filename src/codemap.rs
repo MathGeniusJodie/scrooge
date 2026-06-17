@@ -248,7 +248,13 @@ fn index_file(map: &mut CodeMap, rel: &Path, src: &str, lang: &Lang) -> Result<(
         return Ok(());
     };
     let bytes = src.as_bytes();
-    walk(map, rel, bytes, tree.root_node(), lang, None);
+    Walker {
+        map,
+        rel,
+        bytes,
+        lang,
+    }
+    .walk(tree.root_node(), None);
     Ok(())
 }
 
@@ -312,97 +318,100 @@ fn name_of(node: Node, bytes: &[u8]) -> Option<String> {
         .map(|n| text(n, bytes).to_string())
 }
 
-/// Recursively walk the AST collecting definitions; `parent` is the enclosing
-/// class/impl/function used to qualify methods and attribute call edges.
-fn walk(
-    map: &mut CodeMap,
-    rel: &Path,
-    bytes: &[u8],
-    node: Node,
-    lang: &Lang,
-    parent: Option<&str>,
-) {
-    let kind = node.kind();
-    let def: Option<(SymbolKind, Option<String>)> = match (lang, kind) {
-        (Lang::Rust, "function_item") | (Lang::Python, "function_definition") => Some((
-            if parent.is_some() {
-                SymbolKind::Method
-            } else {
-                SymbolKind::Function
-            },
-            name_of(node, bytes),
-        )),
-        (Lang::Rust, "struct_item") => Some((SymbolKind::Struct, name_of(node, bytes))),
-        (Lang::Rust, "enum_item") => Some((SymbolKind::Enum, name_of(node, bytes))),
-        (Lang::Rust, "trait_item") => Some((SymbolKind::Trait, name_of(node, bytes))),
-        (Lang::Rust, "impl_item") => Some((
-            SymbolKind::Impl,
-            node.child_by_field_name("type")
-                .map(|n| text(n, bytes).to_string()),
-        )),
-        (Lang::Python, "class_definition") | (Lang::Js, "class_declaration") => {
-            Some((SymbolKind::Class, name_of(node, bytes)))
-        }
-        (Lang::Js, "function_declaration" | "generator_function_declaration") => {
-            Some((SymbolKind::Function, name_of(node, bytes)))
-        }
-        (Lang::Js, "method_definition") => Some((SymbolKind::Method, name_of(node, bytes))),
-        _ => None,
-    };
+/// Holds the per-file context for an AST walk so the recursion only threads the
+/// node and enclosing parent, rather than six unchanging arguments.
+struct Walker<'a> {
+    map: &'a mut CodeMap,
+    rel: &'a Path,
+    bytes: &'a [u8],
+    lang: &'a Lang,
+}
 
-    // JS: const foo = () => {} / function expressions assigned to names.
-    let js_assigned_fn = if matches!((lang, kind), (Lang::Js, "variable_declarator")) {
-        let is_fn = node
-            .child_by_field_name("value")
-            .is_some_and(|v| matches!(v.kind(), "arrow_function" | "function_expression"));
-        if is_fn { name_of(node, bytes) } else { None }
-    } else {
-        None
-    };
-
-    let mut new_parent: Option<String> = None;
-    if let Some((skind, Some(name))) = def {
-        let qualified = match (&skind, parent) {
-            (SymbolKind::Method, Some(p)) => format!("{p}.{name}"),
-            _ => name.clone(),
-        };
-        let is_container = matches!(
-            skind,
-            SymbolKind::Class | SymbolKind::Impl | SymbolKind::Struct | SymbolKind::Trait
-        );
-        let is_callable = matches!(skind, SymbolKind::Function | SymbolKind::Method);
-        map.symbols.push(Symbol {
-            name: qualified.clone(),
-            kind: skind,
-            signature: first_line(text(node, bytes), lang),
-            file: rel.to_path_buf(),
+impl Walker<'_> {
+    fn push_symbol(&mut self, name: String, kind: SymbolKind, node: Node) {
+        self.map.symbols.push(Symbol {
+            name,
+            kind,
+            signature: first_line(text(node, self.bytes), self.lang),
+            file: self.rel.to_path_buf(),
             line: node.start_position().row + 1,
             end_line: node.end_position().row + 1,
         });
-        if is_container {
-            new_parent = Some(name);
-        }
-        if is_callable {
-            // Record call edges out of this body under the qualified name.
-            collect_calls(map, bytes, node, lang, &qualified);
-            new_parent = Some(qualified); // nested defs still get qualified
-        }
-    } else if let Some(name) = js_assigned_fn {
-        map.symbols.push(Symbol {
-            name: name.clone(),
-            kind: SymbolKind::Function,
-            signature: first_line(text(node, bytes), lang),
-            file: rel.to_path_buf(),
-            line: node.start_position().row + 1,
-            end_line: node.end_position().row + 1,
-        });
-        collect_calls(map, bytes, node, lang, &name);
     }
 
-    let p = new_parent.as_deref().or(parent);
-    let mut c = node.walk();
-    for child in node.children(&mut c) {
-        walk(map, rel, bytes, child, lang, p);
+    /// Recursively walk the AST collecting definitions; `parent` is the
+    /// enclosing class/impl/function used to qualify methods and attribute call
+    /// edges.
+    fn walk(&mut self, node: Node, parent: Option<&str>) {
+        let (lang, bytes) = (self.lang, self.bytes);
+        let kind = node.kind();
+        let def: Option<(SymbolKind, Option<String>)> = match (lang, kind) {
+            (Lang::Rust, "function_item") | (Lang::Python, "function_definition") => Some((
+                if parent.is_some() {
+                    SymbolKind::Method
+                } else {
+                    SymbolKind::Function
+                },
+                name_of(node, bytes),
+            )),
+            (Lang::Rust, "struct_item") => Some((SymbolKind::Struct, name_of(node, bytes))),
+            (Lang::Rust, "enum_item") => Some((SymbolKind::Enum, name_of(node, bytes))),
+            (Lang::Rust, "trait_item") => Some((SymbolKind::Trait, name_of(node, bytes))),
+            (Lang::Rust, "impl_item") => Some((
+                SymbolKind::Impl,
+                node.child_by_field_name("type")
+                    .map(|n| text(n, bytes).to_string()),
+            )),
+            (Lang::Python, "class_definition") | (Lang::Js, "class_declaration") => {
+                Some((SymbolKind::Class, name_of(node, bytes)))
+            }
+            (Lang::Js, "function_declaration" | "generator_function_declaration") => {
+                Some((SymbolKind::Function, name_of(node, bytes)))
+            }
+            (Lang::Js, "method_definition") => Some((SymbolKind::Method, name_of(node, bytes))),
+            _ => None,
+        };
+
+        // JS: const foo = () => {} / function expressions assigned to names.
+        let js_assigned_fn = if matches!((lang, kind), (Lang::Js, "variable_declarator")) {
+            let is_fn = node
+                .child_by_field_name("value")
+                .is_some_and(|v| matches!(v.kind(), "arrow_function" | "function_expression"));
+            if is_fn { name_of(node, bytes) } else { None }
+        } else {
+            None
+        };
+
+        let mut new_parent: Option<String> = None;
+        if let Some((skind, Some(name))) = def {
+            let qualified = match (&skind, parent) {
+                (SymbolKind::Method, Some(p)) => format!("{p}.{name}"),
+                _ => name.clone(),
+            };
+            let is_container = matches!(
+                skind,
+                SymbolKind::Class | SymbolKind::Impl | SymbolKind::Struct | SymbolKind::Trait
+            );
+            let is_callable = matches!(skind, SymbolKind::Function | SymbolKind::Method);
+            self.push_symbol(qualified.clone(), skind, node);
+            if is_container {
+                new_parent = Some(name);
+            }
+            if is_callable {
+                // Record call edges out of this body under the qualified name.
+                collect_calls(self.map, bytes, node, lang, &qualified);
+                new_parent = Some(qualified); // nested defs still get qualified
+            }
+        } else if let Some(name) = js_assigned_fn {
+            self.push_symbol(name.clone(), SymbolKind::Function, node);
+            collect_calls(self.map, bytes, node, lang, &name);
+        }
+
+        let p = new_parent.as_deref().or(parent);
+        let mut c = node.walk();
+        for child in node.children(&mut c) {
+            self.walk(child, p);
+        }
     }
 }
 
