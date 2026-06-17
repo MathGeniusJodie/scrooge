@@ -2,7 +2,7 @@
 //! tree-sitter, then renders ultra-compact briefs for LLM consumption.
 //! Deterministic — costs zero tokens to build.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
@@ -166,7 +166,9 @@ pub fn build_cached(root: &Path) -> Result<Arc<CodeMap>> {
     // Fast path: return the cached map if it is still current. The lock is held
     // only for this cheap comparison.
     {
-        let guard = cache.lock().unwrap();
+        let guard = cache
+            .lock()
+            .map_err(|_| anyhow!("codemap cache lock poisoned"))?;
         if let Some(v) = guard.as_ref()
             && v.0 == root
             && v.1 == mtime
@@ -179,7 +181,10 @@ pub fn build_cached(root: &Path) -> Result<Arc<CodeMap>> {
     // expensive and must not serialize every other lookup behind it (a
     // concurrent caller may redundantly build, but the result is the same).
     let map = Arc::new(build(root)?);
-    *cache.lock().unwrap() = Some((root.to_path_buf(), mtime, count, map.clone()));
+    *cache
+        .lock()
+        .map_err(|_| anyhow!("codemap cache lock poisoned"))? =
+        Some((root.to_path_buf(), mtime, count, map.clone()));
     Ok(map)
 }
 
@@ -596,7 +601,8 @@ impl CodeMap {
                     let bare = s.name.rsplit('.').next().unwrap_or(&s.name);
                     // Short names (run, new, map, ...) match everything and
                     // would silently inflate the slice back to the full brief.
-                    bare.len() >= 4 && contains_word(&text, &bare.to_lowercase())
+                    const MIN_MATCH_NAME_LEN: usize = 4;
+                    bare.len() >= MIN_MATCH_NAME_LEN && contains_word(&text, &bare.to_lowercase())
                 });
             if relevant {
                 out.push_str(&Self::file_line(file, &syms));

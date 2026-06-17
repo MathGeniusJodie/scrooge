@@ -212,6 +212,13 @@ const REPORT_MAX_TOKENS: u32 = 512;
 /// work, or a single check-failure retry that continues the same conversation).
 const CRATCHIT_MAX_ITERS: usize = 40;
 
+/// Maximum number of Scrooge delegation turns before a task is abandoned.
+const MAX_TASK_TURNS: usize = 20;
+
+/// Tool-call budget for one batch of helper validation (Cratchit may read a few
+/// source files before delivering a verdict).
+const HELPER_VALIDATION_MAX_ITERS: usize = 20;
+
 /// Which check suite to run after a delegation. The agent loop runs `Quick`
 /// (a fast compile/typecheck) between steps and `Full` (tests + lint) only to
 /// gate completion; one-shot `scrooge cratchit` runs `Full` directly.
@@ -263,7 +270,7 @@ impl Orchestrator<Client> {
             toolbox: Toolbox::new(root),
             cheap_model: std::env::var("CRATCHIT_MODEL").unwrap_or_else(|_| DEV_MODEL_CHEAP.into()),
             sota_model: std::env::var("SCROOGE_MODEL").unwrap_or_else(|_| DEV_MODEL_SOTA.into()),
-            max_turns: 20,
+            max_turns: MAX_TASK_TURNS,
         })
     }
 }
@@ -729,7 +736,10 @@ impl<C: Chat + Send + Sync> Orchestrator<C> {
                 Message::text("system", HELPER_VALIDATION_SYSTEM),
                 Message::text("user", format!("CANDIDATES:\n{listing}")),
             ];
-            let text = if let Some(text) = self.tool_loop(&mut log, &defs, 20).await? {
+            let text = if let Some(text) = self
+                .tool_loop(&mut log, &defs, HELPER_VALIDATION_MAX_ITERS)
+                .await?
+            {
                 text
             } else {
                 // Tool budget exhausted mid-batch: force a verdict rather

@@ -120,8 +120,11 @@ fn score_map(origin: &str, map: &CodeMap, base: &Path, public_only: bool) -> Vec
         }
         let files = fan_in.get(s.name.as_str()).map_or(0, BTreeSet::len);
         // Single-file usage is not evidence of genericity — only cross-file is.
+        // Cap the fan-in credit so a single ubiquitous symbol can't dominate.
+        const MAX_FANIN_CREDIT: usize = 5;
+        const FANIN_WEIGHT: u32 = 2;
         let cross = if files >= 2 {
-            u32::try_from(files.min(5)).unwrap_or(u32::MAX) * 2
+            u32::try_from(files.min(MAX_FANIN_CREDIT)).unwrap_or(u32::MAX) * FANIN_WEIGHT
         } else {
             0
         };
@@ -308,7 +311,7 @@ pub fn save_cache(root: &Path, helpers: &[Helper]) -> Result<()> {
         .filter(|h| seen.insert((h.origin.clone(), h.name.clone(), h.file.clone())))
         .collect();
     let path = cache_path(root);
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    std::fs::create_dir_all(path.parent().context("cache path has no parent")?)?;
     std::fs::write(&path, serde_json::to_string_pretty(&deduped)?)?;
     Ok(())
 }

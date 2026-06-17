@@ -150,7 +150,7 @@ pub fn load(root: &Path) -> Result<BTreeMap<String, LangChecks>> {
     let path = config_path(root);
     if !path.exists() {
         let defaults = defaults(root);
-        std::fs::create_dir_all(path.parent().unwrap())?;
+        std::fs::create_dir_all(path.parent().context("config path has no parent")?)?;
         let header = "# Per-language check commands run by `scrooge check` after each task.\n\
                       # Edit freely (agents may too). Remove a key to skip that stage.\n\n";
         std::fs::write(

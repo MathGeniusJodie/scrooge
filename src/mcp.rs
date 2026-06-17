@@ -100,7 +100,8 @@ impl Server {
         // values as are buffered, regardless of how reads or whitespace split
         // them. A value straddling two reads simply waits for the next chunk.
         let mut buf: Vec<u8> = Vec::new();
-        let mut chunk = [0u8; 8192];
+        const READ_CHUNK: usize = 8192;
+        let mut chunk = [0u8; READ_CHUNK];
         loop {
             let n = stdin.read(&mut chunk).await?;
             if n == 0 {
@@ -179,10 +180,11 @@ impl Server {
     }
 
     fn orchestrator(&mut self) -> Result<&mut Orchestrator> {
-        if self.orch.is_none() {
-            self.orch = Some(Orchestrator::new(self.root.clone())?);
-        }
-        Ok(self.orch.as_mut().unwrap())
+        let orch = match self.orch.take() {
+            Some(orch) => orch,
+            None => Orchestrator::new(self.root.clone())?,
+        };
+        Ok(self.orch.insert(orch))
     }
 
     async fn call_tool(&mut self, name: &str, args: &Value) -> Result<String> {

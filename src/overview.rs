@@ -4,6 +4,7 @@
 //! existing one), stored in .scrooge/overview.md, freely editable by the
 //! user, and injected verbatim into every Scrooge and Cratchit briefing.
 
+use anyhow::Context;
 use std::path::{Path, PathBuf};
 
 pub fn path(root: &Path) -> PathBuf {
@@ -21,7 +22,7 @@ pub fn load(root: &Path) -> Option<String> {
 
 pub fn save(root: &Path, text: &str) -> anyhow::Result<()> {
     let path = path(root);
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    std::fs::create_dir_all(path.parent().context("overview path has no parent")?)?;
     std::fs::write(&path, text.trim())?;
     Ok(())
 }

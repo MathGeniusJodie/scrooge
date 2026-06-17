@@ -165,7 +165,9 @@ impl Chat for Client {
                         break serde_json::from_str(&text)
                             .context("decoding openrouter response")?;
                     }
-                    let transient = status.as_u16() == 429 || status.is_server_error();
+                    const TOO_MANY_REQUESTS: u16 = 429;
+                    let transient =
+                        status.as_u16() == TOO_MANY_REQUESTS || status.is_server_error();
                     if !transient || attempt > RETRIES {
                         bail!("openrouter error {status}: {text}");
                     }

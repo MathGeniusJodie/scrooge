@@ -285,7 +285,10 @@ fn truncate(s: String, max: usize) -> String {
     if s.len() <= max {
         return s;
     }
-    let head = max / 4;
+    // Keep the head of the output (where errors usually surface) larger than
+    // the tail; a quarter/three-quarters split reads well after truncation.
+    const HEAD_DIVISOR: usize = 4;
+    let head = max / HEAD_DIVISOR;
     let head_end = crate::util::floor_char_boundary(&s, head);
     let tail_start = crate::util::ceil_char_boundary(&s, s.len() - (max - head));
     format!(
@@ -714,9 +717,10 @@ impl Toolbox {
         unsafe {
             cmd.pre_exec(crate::sandbox::confiner(&self.root));
         }
-        let out = tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output())
+        const TIMEOUT_SECS: u64 = 60;
+        let out = tokio::time::timeout(std::time::Duration::from_secs(TIMEOUT_SECS), cmd.output())
             .await
-            .map_err(|_| anyhow::anyhow!("timed out after 60s"))??;
+            .map_err(|_| anyhow::anyhow!("timed out after {TIMEOUT_SECS}s"))??;
         let mut s = String::from_utf8_lossy(&out.stdout).to_string();
         let err = String::from_utf8_lossy(&out.stderr);
         if !err.trim().is_empty() {
@@ -787,9 +791,10 @@ impl Toolbox {
                 if docs.is_empty() {
                     return Ok("no MDN results".into());
                 }
+                const MAX_RESULTS: usize = 5;
                 Ok(docs
                     .iter()
-                    .take(5)
+                    .take(MAX_RESULTS)
                     .map(|d| {
                         format!(
                             "{} — {}\n  https://developer.mozilla.org{}",
@@ -948,7 +953,8 @@ async fn rust_doc(query: &str) -> Result<String> {
     // Skip the nav boilerplate: start at the item name, then take a window.
     let needle = query.rsplit("::").next().unwrap_or(query);
     let start = text.find(needle).unwrap_or(0);
-    let end = crate::util::floor_char_boundary(&text, (start + 4000).min(text.len()));
+    const DOC_WINDOW: usize = 4000;
+    let end = crate::util::floor_char_boundary(&text, (start + DOC_WINDOW).min(text.len()));
     Ok(text[start..end].to_string())
 }
 
