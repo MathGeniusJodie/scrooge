@@ -1,6 +1,7 @@
 mod accounting;
 mod agents;
 mod checks;
+mod cleanup;
 mod codemap;
 mod complexity;
 mod helpers;
@@ -79,6 +80,9 @@ enum Cmd {
     /// Hunt down every humbug: run the full check suite (format, tests, lint).
     /// Alias for `check`. Exit code: 0 clean, 1 errors, 2 warnings.
     Humbugs,
+    /// Run the checks, apply the mechanical autofixes, then hand each remaining
+    /// problem to Cratchit to fix one at a time, re-verifying after each.
+    Cleanup,
     /// Find generic utility/helper functions in the repo (and dependencies
     /// with --deps), so agents reuse instead of reinventing. Results are
     /// cached in .scrooge/helpers.json and served by the `helpers` tool.
@@ -109,6 +113,7 @@ async fn main() -> Result<()> {
             | Cmd::RefreshOverview { .. }
             | Cmd::Check
             | Cmd::Humbugs
+            | Cmd::Cleanup
             | Cmd::Helpers { validate: true, .. }
     ) {
         sandbox::preflight();
@@ -128,11 +133,17 @@ async fn main() -> Result<()> {
             println!("{}", codemap::build(&root)?.callees_of(&name).join("\n"));
         }
         Cmd::Run { task } => {
+            if !cleanup::ensure_clean_or_prompt(&root).await? {
+                return Ok(());
+            }
             let mut orch = agents::Orchestrator::new(root)?;
             let out = orch.run_task(&task).await?;
             println!("{out}{}", orch.wages_footer());
         }
         Cmd::Cratchit { task } => {
+            if !cleanup::ensure_clean_or_prompt(&root).await? {
+                return Ok(());
+            }
             let mut orch = agents::Orchestrator::new(root)?;
             let out = orch.delegate(&task, &task).await?;
             println!("{out}{}", orch.wages_footer());
@@ -160,6 +171,7 @@ async fn main() -> Result<()> {
                 std::process::exit(2);
             }
         }
+        Cmd::Cleanup => cleanup::run(&root).await?,
         Cmd::Helpers { deps, validate } => {
             let mut list = helpers::repo_helpers(&root)?;
             if deps {
