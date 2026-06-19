@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use crate::accounting;
 
 pub const DEV_MODEL_CHEAP: &str = "@preset/cratchit"; // cratchit
-pub const DEV_MODEL_SOTA: &str = "deepseek/deepseek-v4-flash"; // scrooge (swap before real use)
+pub const DEV_MODEL_SOTA: &str = "@preset/scrooge"; // scrooge
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Message {
