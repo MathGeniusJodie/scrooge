@@ -75,11 +75,25 @@ fn build_ruleset(root: &Path) -> Result<RulesetCreated, Box<dyn std::error::Erro
     .map(PathBuf::from)
     .filter(|p| p.exists())
     .collect();
+    // Read-only: the user's global git config (~/.gitconfig and the ~/.config/git
+    // dir holding config/ignore/attributes). git is a tool the check suite
+    // genuinely needs — many projects' tests shell out to it — and it aborts
+    // entirely when it can't read these (`unable to access '~/.gitconfig'` /
+    // `cannot use ~/.config/git/ignore as an exclude file`). These are
+    // non-secret config, so granting read of them (rather than the whole home
+    // dir) keeps the credentials in ~/.ssh, ~/.aws &c. unreadable.
+    let mut read_files: Vec<PathBuf> = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        read_files.push(Path::new(&home).join(".gitconfig"));
+        read_files.push(Path::new(&home).join(".config/git"));
+    }
+    read_files.retain(|p| p.exists());
     Ok(Ruleset::default()
         .handle_access(AccessFs::from_all(abi))?
         .create()?
         .add_rules(path_beneath_rules(&readable, AccessFs::from_read(abi)))?
         .add_rules(path_beneath_rules(&writable, AccessFs::from_all(abi)))?
+        .add_rules(path_beneath_rules(&read_files, AccessFs::ReadFile))?
         .add_rules(path_beneath_rules(
             &dev_files,
             AccessFs::WriteFile | AccessFs::ReadFile,

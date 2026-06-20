@@ -713,6 +713,22 @@ impl<C: Chat + Send + Sync> Orchestrator<C> {
         ))
     }
 
+    /// Fix a single diagnostic for `scrooge cleanup`, then return — no internal
+    /// check-retry loop. Cleanup is *itself* the verify-and-retry loop: it
+    /// re-runs the check suite after every fix and hands the next single problem
+    /// to a fresh Cratchit. Running `execute_and_verify`'s full-suite retry here
+    /// would defeat that — it sees the whole tree's remaining diagnostics and
+    /// feeds them all back ("fix the failures below"), so every step tries to fix
+    /// every bug at once. Here Cratchit fixes the one problem; the outer loop
+    /// verifies and decides what comes next.
+    pub async fn delegate_one(&mut self, task: &str, instructions: &str) -> Result<String> {
+        require_git_repo(&self.toolbox.root)?;
+        self.ensure_overview(task).await?;
+        let mut log = self.cratchit_brief(task, instructions, None, true)?;
+        let report = self.run_cratchit(&mut log, &tools::definitions()).await?;
+        Ok(clamp_report(&report))
+    }
+
     /// One-shot question for the cheap model with full tool access.
     pub async fn ask(&mut self, question: &str) -> Result<String> {
         self.cratchit_execute(question, ASK_INSTRUCTIONS, None)
