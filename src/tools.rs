@@ -408,6 +408,7 @@ impl Toolbox {
             // Cap range size too, or 1..999999 would bypass the
             // whole-file guard below.
             let wanted = b.unwrap_or(usize::MAX);
+            let (a, wanted) = (a.min(wanted), wanted.max(a));
             let capped = wanted.min(a.saturating_add(MAX_RANGE_LINES - 1));
             let window = &lines[(a.saturating_sub(1)).min(total)..capped.min(total)];
             if window.is_empty() {
