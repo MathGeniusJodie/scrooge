@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::agents::Orchestrator;
+use crate::tools::Toolbox;
 use crate::{codemap, helpers, practices};
 
 pub struct Server {
@@ -29,9 +30,28 @@ fn tool_list() -> Value {
     json!([
         tool(
             "get_brief",
-            "Project overview (what the codebase is and how it hangs together) plus a compact codebase map: every file with its functions/classes/line numbers. Pass `about` (task keywords) to slice the map — only matching files in full, the rest as names. Never read source files directly — that's what Cratchit is for.",
+            "Project overview (what the codebase is and how it hangs together) plus a compact codebase map: every file with its functions/classes/line numbers. Pass `about` (task keywords) to slice the map — only matching files in full, the rest as names. For targeted source reads use read_file / read_symbol; for broader investigation delegate to Cratchit.",
             &json!({"about": {"type": "string", "description": "task keywords to slice the brief by, optional"}}),
             &[]
+        ),
+        tool(
+            "read_file",
+            "Read a file. Every line is returned tagged `LINE#HASH:content` (e.g. `12#MQ:    let x = 1;`). Files over 2000 lines return an outline instead; pass start_line/end_line (max 2000 lines per call). Prefer narrow ranges — reading whole large files burns context.",
+            &json!({
+                "path": {"type": "string"},
+                "start_line": {"type": "integer", "description": "1-based, optional"},
+                "end_line": {"type": "integer", "description": "inclusive, optional"}
+            }),
+            &["path"]
+        ),
+        tool(
+            "read_symbol",
+            "Read a whole function/method/struct's source by its code-map name — the parser supplies the exact span, so no line guessing. Prefer this over read_file when you want one definition. Optional path narrows when the name is ambiguous.",
+            &json!({
+                "name": {"type": "string", "description": "symbol name from the code map, e.g. 'parse' or 'Client.chat'"},
+                "path": {"type": "string", "description": "file filter when ambiguous, optional"}
+            }),
+            &["name"]
         ),
         tool(
             "run_checks",
@@ -82,6 +102,12 @@ fn tool_list() -> Value {
             "ask_cratchit",
             "Have Cratchit investigate a question with his tools and return a compressed answer. Use instead of reading code yourself.",
             &json!({"question": {"type": "string"}}),
+            &["question"]
+        ),
+        tool(
+            "ask_user",
+            "Ask the user a clarifying question about implementation details. The user must input an answer and press enter before the model continues.",
+            &json!({"question": {"type": "string", "description": "the question to ask the user"}}),
             &["question"]
         ),
     ])
@@ -205,6 +231,10 @@ impl Server {
                     None => brief,
                 })
             }
+            "read_file" | "read_symbol" => {
+                let tb = Toolbox::new(self.root.clone());
+                Ok(tb.call(name, args).await)
+            }
             "run_checks" => {
                 let root = self.root.clone();
                 let report =
@@ -234,6 +264,11 @@ impl Server {
             "ask_cratchit" => {
                 let q = s("question");
                 self.orchestrator()?.ask(&q).await
+            }
+            "ask_user" => {
+                anyhow::bail!(
+                    "ask_user is only available in CLI mode — stdin is occupied by the MCP protocol"
+                )
             }
             _ => anyhow::bail!("unknown tool {name}"),
         }

@@ -150,6 +150,16 @@ pub fn definitions() -> Vec<Value> {
         ),
         web_answer_tool(),
         tool(
+            "ask_user",
+            "Ask the user a clarifying question about implementation details. The user \
+             must input an answer and press enter before the model continues. Use this \
+             when you need the human to make a design choice or provide specific details.",
+            &obj(
+                &json!({"question": {"type": "string", "description": "the question to ask the user"}}),
+                &["question"],
+            ),
+        ),
+        tool(
             "add_dependency",
             "Add a dependency at its latest published version (cargo add / pip install -U / npm install @latest). Never write version numbers from memory.",
             &obj(
@@ -160,13 +170,37 @@ pub fn definitions() -> Vec<Value> {
     ]
 }
 
-/// Scrooge's tools. `delegate_to_cratchit` is the workhorse; `symbol_info` /
-/// `callers` / `callees` are free, deterministic call-graph lookups answered
-/// locally (no Cratchit round); `web_answer` is rate-limited to
-/// `SCROOGE_WEB_LOOKUPS` uses. The list is stable across a task so the
-/// provider's KV cache survives every turn.
+/// Scrooge's tools. `delegate_to_cratchit` is the workhorse; `read_file` /
+/// `read_symbol` let Scrooge inspect source directly without spending a
+/// Cratchit round; `symbol_info` / `callers` / `callees` are free, deterministic
+/// call-graph lookups answered locally (no Cratchit round); `web_answer` is
+/// rate-limited to `SCROOGE_WEB_LOOKUPS` uses. The list is stable across a task
+/// so the provider's KV cache survives every turn.
 pub fn scrooge_definitions() -> Vec<Value> {
     vec![
+        tool(
+            "read_file",
+            "Read a file. Every line is returned tagged `LINE#HASH:content` (e.g. `12#MQ:    let x = 1;`); pass those LINE#HASH anchors to edit_file. Files over 2000 lines return an outline instead; pass start_line/end_line (max 2000 lines per call). Prefer narrow ranges — reading whole large files burns context.",
+            &obj(
+                &json!({
+                    "path": {"type": "string"},
+                    "start_line": {"type": "integer", "description": "1-based, optional"},
+                    "end_line": {"type": "integer", "description": "inclusive, optional"}
+                }),
+                &["path"],
+            ),
+        ),
+        tool(
+            "read_symbol",
+            "Read a whole function/method/struct's source by its code-map name — the parser supplies the exact span, so no line guessing. Prefer this over a read_file range when you want one definition. Optional path narrows when the name is ambiguous.",
+            &obj(
+                &json!({
+                    "name": {"type": "string", "description": "symbol name from the code map, e.g. 'parse' or 'Client.chat'"},
+                    "path": {"type": "string", "description": "file filter when ambiguous, optional"}
+                }),
+                &["name"],
+            ),
+        ),
         tool(
             "delegate_to_cratchit",
             "Dispatch one step to Cratchit for execution. Cratchit has full tool access \
@@ -197,6 +231,16 @@ pub fn scrooge_definitions() -> Vec<Value> {
             &obj(&json!({"name": {"type": "string"}}), &["name"]),
         ),
         web_answer_tool(),
+        tool(
+            "ask_user",
+            "Ask the user a clarifying question about implementation details. The user \
+             must input an answer and press enter before the model continues. Use this \
+             when you need the human to make a design choice or provide specific details.",
+            &obj(
+                &json!({"question": {"type": "string", "description": "the question to ask the user"}}),
+                &["question"],
+            ),
+        ),
     ]
 }
 
@@ -435,6 +479,18 @@ impl Toolbox {
             "add_dependency" => {
                 let dev = args["dev"].as_bool().unwrap_or(false);
                 self.add_dependency(&s("lang"), &s("package"), dev).await
+            }
+            "ask_user" => {
+                use std::io::Write;
+                let question = s("question");
+                eprintln!("\n--- Ask the user ---");
+                eprintln!("{question}");
+                eprintln!("--- Press enter after your answer ---");
+                // Flush stderr so the prompt is visible even if buffered.
+                let _ = std::io::stderr().flush();
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer)?;
+                Ok(answer.trim().to_string())
             }
             _ => anyhow::bail!("unknown tool {name}"),
         }
