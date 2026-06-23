@@ -43,7 +43,7 @@ pub fn definitions() -> Vec<Value> {
     vec![
         tool(
             "read_file",
-            "Read a file. Files over 2000 lines return an outline instead; pass start_line/end_line (max 2000 lines per call). Prefer narrow ranges — reading whole large files burns context.",
+            "Read a file. Every line is returned tagged `LINE#HASH:content` (e.g. `12#MQ:    let x = 1;`); pass those LINE#HASH anchors to edit_file. Files over 2000 lines return an outline instead; pass start_line/end_line (max 2000 lines per call). Prefer narrow ranges — reading whole large files burns context.",
             &obj(
                 &json!({
                     "path": {"type": "string"},
@@ -63,7 +63,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "edit_file",
-            "Apply one or more find/replace edits to a file in order, all-or-nothing — batch related edits into ONE call rather than issuing several. Each find must match exactly once (whitespace-tolerant fallback) unless its replace_all is true. Returns applied line numbers and a syntax verdict — no need to re-read.",
+            "Apply hash-anchored edits to a file, all-or-nothing — batch related edits into ONE call. `pos`/`end` are `LINE#HASH` anchors from read_file output that locate (and staleness-check) the target lines; `lines` is the literal new content that goes there (no `LINE#HASH:` prefixes). A stale anchor (the file changed since you read it) is rejected with fresh anchors to retry — never guess a hash. Returns fresh anchors for the changed region and a syntax verdict — no need to re-read. Ops: replace (one line at pos, or the pos..end range; `lines` is the replacement, empty to delete), append (lines after pos, or at EOF if pos omitted), prepend (lines before pos, or at BOF if omitted).",
             &obj(
                 &json!({
                     "path": {"type": "string"},
@@ -72,11 +72,12 @@ pub fn definitions() -> Vec<Value> {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "find": {"type": "string"},
-                                "replace": {"type": "string"},
-                                "replace_all": {"type": "boolean", "description": "replace every occurrence, optional"}
+                                "op": {"type": "string", "enum": ["replace", "append", "prepend"]},
+                                "pos": {"type": "string", "description": "anchor LINE#HASH, e.g. '12#MQ'"},
+                                "end": {"type": "string", "description": "range end anchor for replace, optional"},
+                                "lines": {"type": "array", "items": {"type": "string"}, "description": "literal new lines to write at the anchor"}
                             },
-                            "required": ["find", "replace"]
+                            "required": ["op", "lines"]
                         }
                     }
                 }),
@@ -231,53 +232,6 @@ const MAX_WHOLE_FILE_LINES: usize = 2000;
 /// Largest line range a single `read_file` call returns.
 const MAX_RANGE_LINES: usize = 2000;
 
-/// Whitespace-tolerant match: byte ranges of line windows whose trimmed
-/// lines equal the trimmed lines of `find`.
-fn fuzzy_match_ranges(content: &str, find: &str) -> Vec<(usize, usize)> {
-    let needle: Vec<&str> = find.lines().map(str::trim).collect();
-    if needle.is_empty() {
-        return vec![];
-    }
-    // (start_byte, content_end_byte) for each line, derived purely from the raw
-    // bytes — `str::lines` strips a trailing `\r`, so deriving the end offset
-    // from `lines[k].len()` would land one byte early on a CRLF file and splice
-    // mid-`\r`. Tracking it here keeps the offsets honest for either ending.
-    let bytes = content.as_bytes();
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    let mut start = 0usize;
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == b'\n' {
-            let end = if i > start && bytes[i - 1] == b'\r' {
-                i - 1
-            } else {
-                i
-            };
-            spans.push((start, end));
-            start = i + 1;
-        }
-    }
-    // Final line with no trailing newline.
-    if start < bytes.len() {
-        spans.push((start, bytes.len()));
-    }
-    // Each span's [start, content_end) slice is the line minus its ending, so
-    // it stands in for `content.lines()` without a second pass/allocation.
-    let mut out = Vec::new();
-    if spans.len() < needle.len() {
-        return out;
-    }
-    for i in 0..=spans.len() - needle.len() {
-        if (0..needle.len()).all(|j| {
-            let (s, e) = spans[i + j];
-            content[s..e].trim() == needle[j]
-        }) {
-            let last = i + needle.len() - 1;
-            out.push((spans[i].0, spans[last].1));
-        }
-    }
-    out
-}
-
 /// Keep head AND tail when truncating: compiler errors and test failures
 /// land at the end of long outputs, which a head-only cut would discard.
 /// `max` is the per-tool budget (`read_file` gets a bigger one than shell).
@@ -297,22 +251,6 @@ fn truncate(s: String, max: usize) -> String {
         tail_start - head_end,
         &s[tail_start..]
     )
-}
-
-/// Numbered lines around a replaced byte region, so the model can confirm an
-/// edit from the tool result instead of re-reading the file.
-fn edit_echo(content: &str, at: usize, len: usize) -> String {
-    let first = content[..at].matches('\n').count();
-    let last = first + content[at..at + len].matches('\n').count();
-    let lo = first.saturating_sub(2);
-    content
-        .lines()
-        .enumerate()
-        .skip(lo)
-        .take(last + 2 - lo + 1)
-        .map(|(i, l)| format!("{}|{l}", i + 1))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// Empty tool results read as silence to a cheap model (it retries or
@@ -413,6 +351,8 @@ impl Toolbox {
         let s = |k: &str| crate::util::str_arg(args, k);
         let path = self.resolve(&s("path"));
         let content = std::fs::read_to_string(&path)?;
+        let lines: Vec<&str> = content.lines().collect();
+        let total = lines.len();
         let end = args["end_line"].as_u64().map(|n| n as usize);
         // A bare end_line (no start) reads from line 1 rather than
         // silently falling through to a whole-file read.
@@ -425,36 +365,30 @@ impl Toolbox {
             // whole-file guard below.
             let wanted = b.unwrap_or(usize::MAX);
             let capped = wanted.min(a.saturating_add(MAX_RANGE_LINES - 1));
-            // Lines are returned unnumbered, matching a whole-file read.
-            let mut out = content
-                .lines()
-                .enumerate()
-                .filter(|(i, _)| *i + 1 >= a && *i < capped)
-                .map(|(_, l)| l)
-                .collect::<Vec<_>>()
-                .join("\n");
-            let total = content.lines().count();
-            if out.is_empty() {
-                out = format!(
+            let window = &lines[(a.saturating_sub(1)).min(total)..capped.min(total)];
+            if window.is_empty() {
+                format!(
                     "no lines in range {a}-{} — file has {total} lines",
                     if wanted == usize::MAX { total } else { wanted }
-                );
-            } else if capped < wanted && capped < total {
-                write!(
-                    out,
-                    "\n[range clamped to {MAX_RANGE_LINES} lines; \
-                     request another range to continue]"
                 )
-                .unwrap();
-            }
-            out
-        } else {
-            let total = content.lines().count();
-            if total > MAX_WHOLE_FILE_LINES {
-                self.file_outline(&path, total)?
             } else {
-                content
+                // Tagged with LINE#HASH anchors so the model can edit without
+                // re-reading; line numbers start at the window's first line.
+                let mut out = crate::hashline::format_region(window, a);
+                if capped < wanted && capped < total {
+                    write!(
+                        out,
+                        "\n[range clamped to {MAX_RANGE_LINES} lines; \
+                         request another range to continue]"
+                    )
+                    .unwrap();
+                }
+                out
             }
+        } else if total > MAX_WHOLE_FILE_LINES {
+            self.file_outline(&path, total)?
+        } else {
+            crate::hashline::format_region(&lines, 1)
         })
     }
 
@@ -503,105 +437,35 @@ impl Toolbox {
         }
     }
 
-    /// Batched find/replace: edits apply in order on an in-memory copy and
-    /// nothing is written unless every edit succeeds, so a failure report
-    /// always means "file untouched".
+    /// Hash-anchored editing: edits validate against the file's current
+    /// `LINE#HASH` anchors and apply on an in-memory copy, all-or-nothing, so a
+    /// failure report always means "file untouched". A stale anchor is rejected
+    /// with a fresh-anchor retry snippet rather than corrupting the file.
     async fn edit_file(&self, args: &Value) -> Result<String> {
-        struct E {
-            find: String,
-            replace: String,
-            all: bool,
-        }
         let path = self.resolve_write(args["path"].as_str().unwrap_or(""))?;
-        let mut content = std::fs::read_to_string(&path)?;
+        let content = std::fs::read_to_string(&path)?;
 
-        // Array form is canonical; the legacy single find/replace form is
-        // still accepted so a confused model isn't hard-stuck.
-        let edits: Vec<E> = args["edits"].as_array().map_or_else(
-            || {
-                vec![E {
-                    find: args["find"].as_str().unwrap_or("").to_string(),
-                    replace: args["replace"].as_str().unwrap_or("").to_string(),
-                    all: args["replace_all"].as_bool().unwrap_or(false),
-                }]
-            },
-            |arr| {
-                arr.iter()
-                    .map(|e| E {
-                        find: e["find"].as_str().unwrap_or("").to_string(),
-                        replace: e["replace"].as_str().unwrap_or("").to_string(),
-                        all: e["replace_all"].as_bool().unwrap_or(false),
-                    })
-                    .collect()
-            },
-        );
-        if edits.is_empty() || edits.iter().any(|e| e.find.is_empty()) {
-            anyhow::bail!("no edits given (each needs a non-empty `find`)");
+        let edits = crate::hashline::parse_edits(&args["edits"])?;
+        if edits.is_empty() {
+            anyhow::bail!("no edits given");
         }
-
-        let line_of = |content: &str, at: usize| content[..at].matches('\n').count() + 1;
-        let mut notes = Vec::new();
-        // Region of the most recent single replacement — later edits can't
-        // shift it, so it is always valid to echo after the loop.
-        let mut last_region: Option<(usize, usize)> = None;
-        for (i, e) in edits.iter().enumerate() {
-            let n = i + 1;
-            let occurrences: Vec<usize> =
-                content.match_indices(&e.find).map(|(at, _)| at).collect();
-            match occurrences.as_slice() {
-                [] => match fuzzy_match_ranges(&content, &e.find).as_slice() {
-                    [] => anyhow::bail!(
-                        "edit {n}: string not found in {} — no edits applied",
-                        path.display()
-                    ),
-                    [(a, b)] => {
-                        let (a, b) = (*a, *b);
-                        content = format!("{}{}{}", &content[..a], e.replace, &content[b..]);
-                        notes.push(format!(
-                            "edit {n}: line {} (whitespace-tolerant)",
-                            line_of(&content, a)
-                        ));
-                        last_region = Some((a, e.replace.len()));
-                    }
-                    m => anyhow::bail!(
-                        "edit {n}: matches {} places ignoring whitespace — no edits applied",
-                        m.len()
-                    ),
-                },
-                [at] => {
-                    let at = *at;
-                    content = format!(
-                        "{}{}{}",
-                        &content[..at],
-                        e.replace,
-                        &content[at + e.find.len()..]
-                    );
-                    notes.push(format!("edit {n}: line {}", line_of(&content, at)));
-                    last_region = Some((at, e.replace.len()));
-                }
-                m if e.all => {
-                    content = content.replace(&e.find, &e.replace);
-                    notes.push(format!("edit {n}: replaced {} occurrences", m.len()));
-                    last_region = None;
-                }
-                m => anyhow::bail!(
-                    "edit {n}: string appears {} times; set replace_all or provide \
-                     more context — no edits applied",
-                    m.len()
-                ),
-            }
-        }
-        std::fs::write(&path, &content)?;
+        let result = crate::hashline::apply(&content, &edits)?;
+        std::fs::write(&path, &result.content)?;
 
         let mut out = format!(
-            "applied {} edit(s) ({}); {}",
+            "applied {} edit(s); {}",
             edits.len(),
-            notes.join("; "),
-            syntax_verdict(&path, &content)
+            syntax_verdict(&path, &result.content)
         );
-        if let Some((at, len)) = last_region {
-            out.push('\n');
-            out.push_str(&edit_echo(&content, at, len));
+        for w in &result.warnings {
+            out.push_str("\nwarning: ");
+            out.push_str(w);
+        }
+        // Fresh LINE#HASH anchors for the changed region, ready to chain into
+        // the next edit without a re-read.
+        if let Some(anchors) = result.fresh_anchors() {
+            out.push_str("\n--- anchors ---\n");
+            out.push_str(&anchors);
         }
         Ok(out)
     }
@@ -621,12 +485,7 @@ impl Toolbox {
         if sym.end_line > lines.len() || sym.line == 0 {
             anyhow::bail!("stale span for '{name}' — file changed; retry");
         }
-        let body = lines[sym.line - 1..sym.end_line]
-            .iter()
-            .enumerate()
-            .map(|(i, l)| format!("{}|{l}", sym.line + i))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let body = crate::hashline::format_region(&lines[sym.line - 1..sym.end_line], sym.line);
         Ok(format!(
             "{} @ {}:{}-{}\n{body}",
             sym.name,
@@ -666,8 +525,6 @@ impl Toolbox {
         let mut new_lines: Vec<&str> = lines[..sym.line - 1].to_vec();
         let body = new_source.trim_end_matches(['\n', '\r']);
         let body_lines: Vec<&str> = body.lines().collect();
-        let body_len = body_lines.iter().map(|l| l.len()).sum::<usize>()
-            + body_lines.len().saturating_sub(1) * sep.len();
         new_lines.extend(&body_lines);
         new_lines.extend(&lines[sym.end_line..]);
         let mut new = new_lines.join(sep);
@@ -676,11 +533,11 @@ impl Toolbox {
         }
         std::fs::write(&path, &new)?;
 
-        let at: usize = new
-            .lines()
-            .take(sym.line - 1)
-            .map(|l| l.len() + sep.len())
-            .sum();
+        // Echo the new definition with fresh LINE#HASH anchors, ready to chain
+        // into a follow-up edit_file without a re-read.
+        let new_lines: Vec<&str> = new.lines().collect();
+        let echo_end = (sym.line - 1 + body_lines.len()).min(new_lines.len());
+        let echo = crate::hashline::format_region(&new_lines[sym.line - 1..echo_end], sym.line);
         Ok(format!(
             "replaced {} ({}:{}-{}); {}\n{}",
             sym.name,
@@ -688,7 +545,7 @@ impl Toolbox {
             sym.line,
             sym.end_line,
             syntax_verdict(&path, &new),
-            edit_echo(&new, at, body_len)
+            echo
         ))
     }
 
@@ -1014,38 +871,53 @@ mod tests {
         assert!(out.contains("[exit"), "expected failure, got: {out}");
     }
 
+    /// `LINE#HASH` anchor for the 1-based `line` of `content`.
+    fn anchor(content: &str, line: usize) -> String {
+        let l = content.lines().nth(line - 1).unwrap();
+        format!("{line}#{}", crate::hashline::compute_line_hash(line, l))
+    }
+
     #[tokio::test]
-    async fn edit_file_batch_is_all_or_nothing() {
+    async fn edit_file_applies_hash_anchored_edits() {
         let tb = toolbox();
         let p = tb.root.join("batch.rs");
-        std::fs::write(&p, "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
-        // second edit fails -> nothing applied
+        let src = "fn a() {}\nfn b() {}\nfn c() {}\n";
+        std::fs::write(&p, src).unwrap();
         let out = tb
             .call(
                 "edit_file",
                 &json!({"path": "batch.rs", "edits": [
-                    {"find": "fn a", "replace": "fn alpha"},
-                    {"find": "fn zzz", "replace": "fn z"}
-                ]}),
-            )
-            .await;
-        assert!(out.contains("no edits applied"), "unexpected: {out}");
-        assert!(std::fs::read_to_string(&p).unwrap().contains("fn a()"));
-        // valid batch applies in order, with replace_all
-        let out = tb
-            .call(
-                "edit_file",
-                &json!({"path": "batch.rs", "edits": [
-                    {"find": "fn a", "replace": "fn alpha"},
-                    {"find": "()", "replace": "(x: u8)", "replace_all": true}
+                    {"op": "replace", "pos": anchor(src, 1), "lines": ["fn alpha() {}"]},
+                    {"op": "append", "pos": anchor(src, 3), "lines": ["fn d() {}"]}
                 ]}),
             )
             .await;
         assert!(out.contains("applied 2 edit(s)"), "unexpected: {out}");
-        assert!(out.contains("3 occurrences"), "unexpected: {out}");
+        assert!(
+            out.contains("--- anchors ---"),
+            "fresh anchors echoed: {out}"
+        );
         let now = std::fs::read_to_string(&p).unwrap();
-        assert!(now.contains("fn alpha(x: u8)"));
-        assert!(now.contains("fn c(x: u8)"));
+        assert_eq!(now, "fn alpha() {}\nfn b() {}\nfn c() {}\nfn d() {}\n");
+    }
+
+    #[tokio::test]
+    async fn edit_file_rejects_stale_anchor_untouched() {
+        let tb = toolbox();
+        let p = tb.root.join("stale.rs");
+        let src = "fn a() {}\nfn b() {}\n";
+        std::fs::write(&p, src).unwrap();
+        // A wrong hash on line 1 -> stale, nothing applied.
+        let out = tb
+            .call(
+                "edit_file",
+                &json!({"path": "stale.rs", "edits": [
+                    {"op": "replace", "pos": "1#ZZ", "lines": ["fn alpha() {}"]}
+                ]}),
+            )
+            .await;
+        assert!(out.contains("E_STALE_ANCHOR"), "unexpected: {out}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), src, "file untouched");
     }
 
     #[tokio::test]
@@ -1085,8 +957,14 @@ mod tests {
             !out.contains("fn rd_keep()"),
             "should not bleed into neighbor: {out}"
         );
-        // Numbered, starting at the symbol's real line (5).
-        assert!(out.contains("5|fn rd_target()"), "unexpected: {out}");
+        // Tagged with a LINE#HASH anchor starting at the symbol's real line (5).
+        assert!(
+            out.contains(&format!(
+                "5#{}",
+                crate::hashline::compute_line_hash(5, "fn rd_target() {")
+            )),
+            "unexpected: {out}"
+        );
     }
 
     #[test]
@@ -1099,40 +977,18 @@ mod tests {
         assert!(t.len() < MAX_OUTPUT + 100);
     }
 
-    #[test]
-    fn edit_echo_numbers_the_region() {
-        let content = "a\nb\nNEW1\nNEW2\nc\nd\ne\nf\n";
-        let at = content.find("NEW1").unwrap();
-        let echo = edit_echo(content, at, "NEW1\nNEW2".len());
-        assert!(echo.contains("3|NEW1"));
-        assert!(echo.contains("4|NEW2"));
-        assert!(echo.contains("1|a"), "leading context");
-        assert!(echo.contains("6|d"), "trailing context");
-        assert!(!echo.contains("7|e"), "bounded context");
-    }
-
-    #[test]
-    fn fuzzy_match_ignores_indentation() {
-        let content = "fn a() {\n    let x = 1;\n    let y = 2;\n}\n";
-        let find = "let x = 1;\nlet y = 2;";
-        let ranges = fuzzy_match_ranges(content, find);
-        assert_eq!(ranges.len(), 1);
-        let (a, b) = ranges[0];
-        assert_eq!(&content[a..b], "    let x = 1;\n    let y = 2;");
-        assert!(fuzzy_match_ranges(content, "let z = 3;").is_empty());
-    }
-
-    #[test]
-    fn fuzzy_match_offsets_survive_crlf() {
-        // CRLF line endings: `str::lines` strips the `\r`, so the byte offsets
-        // must come from the raw bytes or they land one byte early per line.
-        let content = "fn a() {\r\n    let x = 1;\r\n    let y = 2;\r\n}\r\n";
-        let find = "let x = 1;\nlet y = 2;";
-        let ranges = fuzzy_match_ranges(content, find);
-        assert_eq!(ranges.len(), 1);
-        let (a, b) = ranges[0];
-        // The matched slice is exact (no stray `\r`), so a replace splices cleanly.
-        assert_eq!(&content[a..b], "    let x = 1;\r\n    let y = 2;");
+    #[tokio::test]
+    async fn read_file_tags_lines_with_anchors() {
+        let tb = toolbox();
+        std::fs::write(tb.root.join("r.txt"), "alpha\nbeta\n").unwrap();
+        let out = tb.call("read_file", &json!({"path": "r.txt"})).await;
+        assert!(
+            out.contains(&format!(
+                "1#{}:alpha",
+                crate::hashline::compute_line_hash(1, "alpha")
+            )),
+            "unexpected: {out}"
+        );
     }
 
     #[tokio::test]

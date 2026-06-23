@@ -4,6 +4,7 @@ mod checks;
 mod cleanup;
 mod codemap;
 mod complexity;
+mod hashline;
 mod helpers;
 mod mcp;
 mod openrouter;
