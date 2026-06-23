@@ -133,11 +133,11 @@ pub fn definitions() -> Vec<Value> {
             &obj(&json!({"name": {"type": "string"}}), &["name"]),
         ),
         tool(
-            "query_docs",
-            "Official docs: python=pydoc, rust=docs.rs, js=MDN. Check before using any API you are not 100% sure about.",
+            "library_docs",
+            "Fetch upstream docs for a third-party library/dependency (NOT the language or its stdlib — you already know those). If the library is a project dependency the docs are pinned to the installed version; otherwise the latest published version is fetched, so you can also evaluate a crate before adding it. rust=docs.rs, js=unpkg README, python=PyPI.",
             &obj(
-                &json!({"lang": {"type": "string", "enum": ["python", "rust", "js"]}, "query": {"type": "string", "description": "module/symbol, e.g. 'os.path.join', 'serde_json', 'Array.prototype.map'"}}),
-                &["lang", "query"],
+                &json!({"lang": {"type": "string", "enum": ["python", "rust", "js"]}, "library": {"type": "string", "description": "package/crate name, e.g. 'tokio', 'axum', 'requests'"}, "item": {"type": "string", "description": "optional path/symbol to narrow within the library, e.g. 'fs::read_to_string', 'Router::route'"}}),
+                &["lang", "library"],
             ),
         ),
         tool(
@@ -427,7 +427,10 @@ impl Toolbox {
                 Ok(or_none(m.callees_of(&s("name")).join("\n")))
             }
             "helpers" => crate::helpers::filtered_listing(&self.root, &s("filter")),
-            "query_docs" => self.query_docs(&s("lang"), &s("query")).await,
+            "library_docs" => {
+                self.library_docs(&s("lang"), &s("library"), &s("item"))
+                    .await
+            }
             "web_answer" => web_answer(&s("query")).await,
             "add_dependency" => {
                 let dev = args["dev"].as_bool().unwrap_or(false);
@@ -628,44 +631,119 @@ impl Toolbox {
         }
     }
 
-    async fn query_docs(&self, lang: &str, query: &str) -> Result<String> {
-        match lang {
-            "python" => self.run("python3", &["-m", "pydoc", query]).await,
-            "rust" => rust_doc(query).await,
-            "js" => {
-                // MDN's search API returns JSON; extract title/summary/url
-                // instead of dumping the raw payload on the model.
-                let q = query.replace(' ', "+");
-                let url = format!("https://developer.mozilla.org/api/v1/search?q={q}&locale=en-US");
-                let v: Value = http()
-                    .get(&url)
-                    .header("User-Agent", "scrooge-agent")
-                    .send()
-                    .await?
-                    .json()
-                    .await?;
-                let docs = v["documents"].as_array().cloned().unwrap_or_default();
-                if docs.is_empty() {
-                    return Ok("no MDN results".into());
-                }
-                const MAX_RESULTS: usize = 5;
-                Ok(docs
-                    .iter()
-                    .take(MAX_RESULTS)
-                    .map(|d| {
-                        format!(
-                            "{} — {}\n  https://developer.mozilla.org{}",
-                            d["title"].as_str().unwrap_or(""),
-                            d["summary"].as_str().unwrap_or("").trim(),
-                            d["mdn_url"].as_str().unwrap_or("")
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"))
-            }
+    /// Upstream docs for a third-party library. Pins to the version installed in
+    /// the project when the library is a dependency (the version actually
+    /// compiled against), otherwise fetches the latest published version so the
+    /// model can evaluate a library before adding it. The version label tells the
+    /// model which of the two it got.
+    async fn library_docs(&self, lang: &str, library: &str, item: &str) -> Result<String> {
+        let version = pinned_version(&self.root, lang, library);
+        let label = version.as_ref().map_or_else(
+            || format!("{library} latest (not a project dependency)"),
+            |v| format!("{library} {v} (pinned from project)"),
+        );
+        // Docs are immutable per version, so cache them under `.scrooge/docs`
+        // and serve a hit without touching the network.
+        let cache = self.docs_cache_path(lang, library, version.as_deref(), item);
+        if let Some(body) = cache.as_ref().and_then(|p| std::fs::read_to_string(p).ok()) {
+            return Ok(format!("{label} [cached]\n\n{body}"));
+        }
+        let body = match lang {
+            "rust" => rust_doc(library, item, version.as_deref()).await?,
+            "js" => js_doc(library, version.as_deref()).await?,
+            "python" => py_doc(library, version.as_deref()).await?,
             _ => anyhow::bail!("unsupported lang {lang}"),
+        };
+        if let Some(path) = cache {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(&path, &body);
+        }
+        Ok(format!("{label}\n\n{body}"))
+    }
+
+    /// Filesystem path for a library-docs cache entry, laid out as
+    /// `.scrooge/docs/{lang}/{library}@{version}/{item}.md`. Returns `None` when
+    /// the version is unknown (an unpinned `latest` lookup), since a `latest`
+    /// fetch can drift between runs and shouldn't be cached under a stable key.
+    fn docs_cache_path(
+        &self,
+        lang: &str,
+        library: &str,
+        version: Option<&str>,
+        item: &str,
+    ) -> Option<PathBuf> {
+        let slug = |s: &str| {
+            s.chars()
+                .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                .collect::<String>()
+        };
+        let version = version?;
+        let leaf = if item.is_empty() {
+            "index".to_string()
+        } else {
+            slug(item)
+        };
+        Some(
+            self.root
+                .join(".scrooge/docs")
+                .join(lang)
+                .join(format!("{}@{}", slug(library), slug(version)))
+                .join(format!("{leaf}.md")),
+        )
+    }
+}
+
+/// Resolve the version of `library` actually installed in the project, or `None`
+/// if it is not a dependency (in which case the doc fetchers fall back to the
+/// latest published version). Best-effort and silent on failure: a missing or
+/// unparseable manifest just means "no pin", never an error.
+fn pinned_version(root: &Path, lang: &str, library: &str) -> Option<String> {
+    match lang {
+        "rust" => {
+            let lock = std::fs::read_to_string(root.join("Cargo.lock")).ok()?;
+            let doc: toml::Value = toml::from_str(&lock).ok()?;
+            doc.get("package")?
+                .as_array()?
+                .iter()
+                .find(|p| p.get("name").and_then(toml::Value::as_str) == Some(library))
+                .and_then(|p| p.get("version"))
+                .and_then(toml::Value::as_str)
+                .map(str::to_string)
+        }
+        "js" => {
+            let manifest = root.join("node_modules").join(library).join("package.json");
+            let v: Value = serde_json::from_str(&std::fs::read_to_string(manifest).ok()?).ok()?;
+            v["version"].as_str().map(str::to_string)
+        }
+        "python" => python_installed_version(root, library),
+        _ => None,
+    }
+}
+
+/// Read an installed package's version from its `*.dist-info` directory name in
+/// the project venv. `PyPI` normalizes names case-insensitively and treats `-`/`_`
+/// as equivalent, so the match does too.
+fn python_installed_version(root: &Path, pkg: &str) -> Option<String> {
+    let norm = |s: &str| s.replace('_', "-").to_ascii_lowercase();
+    let want = norm(pkg);
+    // .venv/lib/python3.X/site-packages/{name}-{version}.dist-info
+    for entry in std::fs::read_dir(root.join(".venv/lib")).ok()?.flatten() {
+        let Ok(rd) = std::fs::read_dir(entry.path().join("site-packages")) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if let Some(rest) = name.strip_suffix(".dist-info")
+                && let Some((n, v)) = rest.rsplit_once('-')
+                && norm(n) == want
+            {
+                return Some(v.to_string());
+            }
         }
     }
+    None
 }
 
 /// Resolve a code-map name (optionally narrowed by a path substring) to exactly
@@ -773,17 +851,16 @@ const RUST_DOC_KINDS: &[&str] = &[
     "static",
 ];
 
-async fn rust_doc(query: &str) -> Result<String> {
-    let mut segs: Vec<&str> = query.split("::").filter(|s| !s.is_empty()).collect();
-    let Some(krate) = segs.first().copied() else {
-        return Ok("empty query".into());
-    };
-    let root = format!("https://docs.rs/{krate}/latest/{krate}/");
-    let text = if segs.len() <= 1 {
+async fn rust_doc(krate: &str, item: &str, version: Option<&str>) -> Result<String> {
+    let ver = version.unwrap_or("latest");
+    let root = format!("https://docs.rs/{krate}/{ver}/{krate}/");
+    let item = item.trim_start_matches("::");
+    let text = if item.is_empty() {
         fetch_doc(&format!("{root}index.html")).await?
     } else {
-        let item = segs.pop().unwrap();
-        let modpath = segs[1..].join("/");
+        let mut segs: Vec<&str> = item.split("::").filter(|s| !s.is_empty()).collect();
+        let leaf = segs.pop().unwrap_or(item);
+        let modpath = segs.join("/");
         let base = if modpath.is_empty() {
             root.clone()
         } else {
@@ -791,28 +868,92 @@ async fn rust_doc(query: &str) -> Result<String> {
         };
         let mut found = None;
         for kind in RUST_DOC_KINDS {
-            if let Some(t) = fetch_doc(&format!("{base}{kind}.{item}.html")).await? {
+            if let Some(t) = fetch_doc(&format!("{base}{kind}.{leaf}.html")).await? {
                 found = Some(t);
                 break;
             }
         }
         // Fall back to treating the final segment as a module.
         if found.is_none() {
-            found = fetch_doc(&format!("{base}{item}/index.html")).await?;
+            found = fetch_doc(&format!("{base}{leaf}/index.html")).await?;
         }
         found
     };
     let Some(text) = text else {
+        let path = if item.is_empty() {
+            krate.to_string()
+        } else {
+            format!("{krate}::{item}")
+        };
         return Ok(format!(
-            "no docs.rs page found for `{query}` — check the crate/item path"
+            "no docs.rs page found for `{path}` — check the crate/item path"
         ));
     };
-    // Skip the nav boilerplate: start at the item name, then take a window.
-    let needle = query.rsplit("::").next().unwrap_or(query);
+    // Skip the nav boilerplate: start at the item (or crate) name, then window.
+    let needle = item
+        .rsplit("::")
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(krate);
     let start = text.find(needle).unwrap_or(0);
+    Ok(doc_window(&text[start..]))
+}
+
+/// Fetch a JS package's README from unpkg, which serves published package files
+/// at a version. README markdown is returned mostly as-is (it is already terse
+/// text), just windowed.
+async fn js_doc(pkg: &str, version: Option<&str>) -> Result<String> {
+    let ver = version.unwrap_or("latest");
+    for file in ["README.md", "readme.md", "README.markdown"] {
+        let url = format!("https://unpkg.com/{pkg}@{ver}/{file}");
+        if let Some(text) = fetch_raw(&url).await? {
+            return Ok(doc_window(&text));
+        }
+    }
+    Ok(format!("no README found on unpkg for `{pkg}@{ver}`"))
+}
+
+/// Fetch a Python package's summary + long description from the `PyPI` JSON API,
+/// pinned to a version when known.
+async fn py_doc(pkg: &str, version: Option<&str>) -> Result<String> {
+    let url = version.map_or_else(
+        || format!("https://pypi.org/pypi/{pkg}/json"),
+        |v| format!("https://pypi.org/pypi/{pkg}/{v}/json"),
+    );
+    let resp = http()
+        .get(&url)
+        .header("User-Agent", "scrooge-agent")
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Ok(format!("no PyPI entry for `{pkg}`"));
+    }
+    let v: Value = resp.json().await?;
+    let summary = v["info"]["summary"].as_str().unwrap_or("").trim();
+    let desc = v["info"]["description"].as_str().unwrap_or("").trim();
+    Ok(doc_window(format!("{summary}\n\n{desc}").trim()))
+}
+
+/// GET a page and return its raw text (no HTML stripping), or None on a non-2xx
+/// status. For endpoints that already serve plain text/markdown.
+async fn fetch_raw(url: &str) -> Result<Option<String>> {
+    let resp = http()
+        .get(url)
+        .header("User-Agent", "scrooge-agent")
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+    Ok(Some(resp.text().await?))
+}
+
+/// Trim doc text to a fixed character budget on a char boundary — keeps Scrooge
+/// miserly regardless of how much the upstream page dumps.
+fn doc_window(text: &str) -> String {
     const DOC_WINDOW: usize = 4000;
-    let end = crate::util::floor_char_boundary(&text, (start + DOC_WINDOW).min(text.len()));
-    Ok(text[start..end].to_string())
+    let end = crate::util::floor_char_boundary(text, DOC_WINDOW.min(text.len()));
+    text[..end].to_string()
 }
 
 #[cfg(test)]
