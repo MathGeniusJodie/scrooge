@@ -111,17 +111,6 @@ const CHECK_FAILURE_INSTRUCTIONS: &str = "\
 The deterministic check suite failed after your last changes. Fix the \
 failures below, then verify.\n{FAILURES}";
 
-/// Instruction to write the overview for a brand-new project (no code yet).
-/// Placeholder: {TASK}.
-const OVERVIEW_FRESH_INSTRUCTIONS: &str = "\
-This is a brand-new project being kicked off with this request:\n\
-{TASK}\n\n\
-Write the project overview that future planning will rely on. \
-First line: what the project is, in one sentence. Then one short \
-prose paragraph describing the intended architecture. Do not \
-modify any files. Your final message must be ONLY the overview \
-text, at most 15 lines — it is saved verbatim as overview.md.";
-
 /// Instruction to write the overview for an existing, undocumented codebase.
 const OVERVIEW_EXISTING_INSTRUCTIONS: &str = "\
 This codebase was built without an overview on file. Investigate it \
@@ -542,12 +531,15 @@ impl<C: Chat + Send + Sync> Orchestrator<C> {
         if let Some(text) = crate::overview::load(&root) {
             return Ok(text);
         }
-        let fresh_project = codemap::build_cached(&root)?.symbols.is_empty();
-        let instructions = if fresh_project {
-            OVERVIEW_FRESH_INSTRUCTIONS.replace("{TASK}", task)
-        } else {
-            OVERVIEW_EXISTING_INSTRUCTIONS.to_string()
-        };
+        if codemap::build_cached(&root)?.symbols.is_empty() {
+            // Nothing on disk yet — there is no architecture to characterize,
+            // so spending a Cratchit turn would only invent one from the task
+            // text. Skip it; the post-task refresh writes the real overview
+            // once code exists.
+            eprintln!("--- fresh project: no overview generated yet ---");
+            return Ok(String::new());
+        }
+        let instructions = OVERVIEW_EXISTING_INSTRUCTIONS.to_string();
         eprintln!("--- no overview on file; cratchit is writing one ---");
         let text = self.cratchit_overview(task, &instructions).await?;
         if text.is_empty() {
@@ -594,7 +586,27 @@ impl<C: Chat + Send + Sync> Orchestrator<C> {
     pub async fn refresh_overview(&mut self, task: &str) {
         let root = self.toolbox.root.clone();
         if crate::overview::load(&root).is_none() {
-            return; // nothing on file to go stale
+            // No overview yet — true on a project that started empty (we skip
+            // generation in ensure_overview until code exists). Now that the
+            // task has produced code, write the first overview from it.
+            match codemap::build_cached(&root) {
+                Ok(map) if map.symbols.is_empty() => {
+                    // Still no code — a normal state for an empty project, not
+                    // a failure. Nothing to describe yet, so just move on.
+                    eprintln!("--- no codemap yet (empty project); overview deferred ---");
+                    return;
+                }
+                Ok(_) => {
+                    if let Err(e) = self.ensure_overview(task).await {
+                        eprintln!("[overview generation failed (task still complete): {e:#}]");
+                    }
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("[overview refresh skipped (codemap failed): {e:#}]");
+                    return;
+                }
+            }
         }
         let changed = worktree_changes(&root)
             .filter(|c| !c.is_empty())
