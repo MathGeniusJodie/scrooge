@@ -29,6 +29,7 @@ impl Chat for FakeChat {
         _messages: &[Message],
         _tools: &[Value],
         _max_tokens: Option<u32>,
+        _reasoning_max_tokens: Option<u32>,
     ) -> Result<Message> {
         Ok(self
             .replies

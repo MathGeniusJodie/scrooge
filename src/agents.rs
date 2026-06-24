@@ -21,7 +21,7 @@ mod repo;
 #[cfg(test)]
 mod tests;
 
-use reply::{arg_preview, clamp_report, parse_tool_args};
+use reply::{arg_preview, clamp_report, clamp_scrooge_read, parse_tool_args};
 use repo::{require_git_repo, worktree_changes, worktree_fingerprint};
 
 use crate::accounting;
@@ -202,7 +202,17 @@ const MAX_FINISH_ATTEMPTS: usize = 4;
 /// a terse delegate instruction. In the rare case a turn hits the cap, the
 /// truncated tool-call JSON is repaired (`parse_tool_args`) and the clipped
 /// instruction is run as-is — we never spend a second turn re-asking.
-const SCROOGE_MAX_TOKENS: u32 = 1024;
+const SCROOGE_MAX_TOKENS: u32 = 2048;
+
+/// Separate cap on Scrooge's thinking block (`OpenRouter` `reasoning` budget), so
+/// a long think can't consume the room `SCROOGE_MAX_TOKENS` reserves for the
+/// visible output/tool call. Must stay below `SCROOGE_MAX_TOKENS`.
+const SCROOGE_THINKING_TOKENS: u32 = 1024;
+
+/// Line cap on a direct Scrooge `read_file`. A peek is fine for a quick check;
+/// past this he should lean on the (free) call graph / `symbol_info` or a targeted
+/// `read_symbol` rather than burning expensive tokens paging through source.
+const SCROOGE_READ_LINES: usize = 50;
 
 /// Output cap for a forced final report (the tool budget ran out). Applied only
 /// to a no-tools completion, so it can never truncate a tool call; a ≤6-line
@@ -325,11 +335,28 @@ impl<C: Chat + Send + Sync> Orchestrator<C> {
                     &log,
                     &defs,
                     Some(SCROOGE_MAX_TOKENS),
+                    Some(SCROOGE_THINKING_TOKENS),
                 )
                 .await?;
             log.push(msg.clone());
 
+            // A turn cut off by the output cap may carry a clipped tool call;
+            // only then do we let parse_tool_args attempt a repair.
+            let truncated = self.client.last_finish_reason() == Some("length");
+
             let Some(calls) = msg.tool_calls.filter(|c| !c.is_empty()) else {
+                // No tool calls. If the output was clipped by the cap, Scrooge
+                // did NOT choose to stop — his reply was cut off mid-thought.
+                // Treating that as DONE would silently pretend success, so
+                // surface it as an error with everything he managed to say.
+                if truncated {
+                    let said = msg.content.as_deref().unwrap_or("").trim();
+                    return Err(anyhow::anyhow!(
+                        "Scrooge's response was clipped by the output cap \
+                         (finish_reason: length) before it completed — this is \
+                         not a successful finish. Full response so far:\n\n{said}"
+                    ));
+                }
                 // Scrooge stopped calling tools — he wants to finish.
                 if let Some(out) = self
                     .try_finish(task, &mut log, &mut st, &structure_before)
@@ -340,9 +367,6 @@ impl<C: Chat + Send + Sync> Orchestrator<C> {
                 continue; // checks red — try_finish nudged Scrooge to fix them
             };
 
-            // A turn cut off by the output cap may carry a clipped tool call;
-            // only then do we let parse_tool_args attempt a repair.
-            let truncated = self.client.last_finish_reason() == Some("length");
             // At most one delegation per turn: Cratchit's report (and its CHECKS
             // verdict) must come back before the next step is planned, so a
             // second delegate call in the same turn was planned blind.
@@ -440,7 +464,14 @@ impl<C: Chat + Send + Sync> Orchestrator<C> {
             "  [scrooge] {name}({})",
             arg_preview(&call.function.arguments)
         );
-        Ok(self.toolbox.call(&name, &args).await)
+        let out = self.toolbox.call(&name, &args).await;
+        // Scrooge's time is too valuable to read whole files: a direct read_file
+        // is clamped to a peek, then he is steered to the cheaper call-graph
+        // tools instead of paging through source line by line.
+        if name == "read_file" {
+            return Ok(clamp_scrooge_read(&out, SCROOGE_READ_LINES));
+        }
+        Ok(out)
     }
 
     /// Handle Scrooge ending his turn without a tool call: decide whether the
@@ -763,7 +794,7 @@ impl<C: Chat + Send + Sync> Orchestrator<C> {
                 // than silently dropping every candidate in the batch.
                 log.push(Message::text("user", HELPER_VALIDATION_STOP));
                 self.client
-                    .chat("cratchit", &self.cheap_model, &log, &[], None)
+                    .chat("cratchit", &self.cheap_model, &log, &[], None, None)
                     .await?
                     .content
                     .unwrap_or_default()
@@ -799,7 +830,7 @@ impl<C: Chat + Send + Sync> Orchestrator<C> {
             }
             let msg = self
                 .client
-                .chat("cratchit", &self.cheap_model, log, defs, None)
+                .chat("cratchit", &self.cheap_model, log, defs, None, None)
                 .await?;
             log.push(msg.clone());
             let Some(calls) = msg.tool_calls.filter(|c| !c.is_empty()) else {
@@ -930,6 +961,7 @@ impl<C: Chat + Send + Sync> Orchestrator<C> {
                 log,
                 &[],
                 Some(REPORT_MAX_TOKENS),
+                None,
             )
             .await?;
         Ok(msg

@@ -25,6 +25,22 @@ pub(super) fn clamp_report(s: &str) -> String {
     out
 }
 
+/// Clamp a direct Scrooge `read_file` result to a peek (`max_lines`). When it
+/// overflows, the surplus is dropped and Scrooge is reminded his time is too
+/// valuable to page through source — `symbol_info` / `read_symbol` are cheaper.
+pub(super) fn clamp_scrooge_read(out: &str, max_lines: usize) -> String {
+    let total = out.lines().count();
+    if total <= max_lines {
+        return out.to_string();
+    }
+    let head: String = out.lines().take(max_lines).collect::<Vec<_>>().join("\n");
+    format!(
+        "{head}\n[read_file clamped to {max_lines} of {total} lines — your time is \
+         valuable: use symbol_info to locate what you need, or read_symbol if you \
+         really must read it, instead of paging through the whole file]"
+    )
+}
+
 /// Short stderr preview of tool-call arguments — a full `write_file` body
 /// would make the log unreadable.
 pub(super) fn arg_preview(args: &str) -> String {

@@ -99,6 +99,7 @@ pub trait Chat {
         messages: &[Message],
         tools: &[Value],
         max_tokens: Option<u32>,
+        reasoning_max_tokens: Option<u32>,
     ) -> impl std::future::Future<Output = Result<Message>> + Send;
 
     /// Cumulative token/cost usage across this backend's lifetime.
@@ -119,7 +120,11 @@ impl Chat for Client {
 
     /// One chat completion. `agent` ("scrooge"/"cratchit") attributes the
     /// tokens in the ledger. `tools` is an OpenAI-format tool list or empty.
-    /// `max_tokens` hard-caps the completion (used to keep Scrooge terse).
+    /// `max_tokens` hard-caps the whole completion (used to keep Scrooge terse).
+    /// `reasoning_max_tokens`, when set, caps the thinking block separately via
+    /// `OpenRouter`'s `reasoning` budget, so a long think can't eat the room
+    /// reserved for the visible output; it must stay below `max_tokens`, which
+    /// still bounds thinking + output together.
     async fn chat(
         &mut self,
         agent: &str,
@@ -127,6 +132,7 @@ impl Chat for Client {
         messages: &[Message],
         tools: &[Value],
         max_tokens: Option<u32>,
+        reasoning_max_tokens: Option<u32>,
     ) -> Result<Message> {
         // Retry transient failures (429 / 5xx / transport errors) with
         // backoff: one network blip must not discard a whole task's tokens.
@@ -142,6 +148,9 @@ impl Chat for Client {
         }
         if let Some(cap) = max_tokens {
             body["max_tokens"] = serde_json::json!(cap);
+        }
+        if let Some(cap) = reasoning_max_tokens {
+            body["reasoning"] = serde_json::json!({ "max_tokens": cap });
         }
         let mut attempt = 0;
         let v: Value = loop {
