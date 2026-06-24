@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Stop hook: when source files changed this session (.scrooge/dirty, set by
-the PostToolUse hook), run `scrooge check`. Test/build failures block the stop
-and are handed back to Scrooge to fix; leftover lint warnings block once and
-are delegated to Cratchit. A retry cap stops infinite fix loops."""
+the PostToolUse hook), run `scrooge cleanup`. Cleanup runs the check suite,
+applies mechanical autofixes, then delegates each remaining problem to Cratchit
+one at a time (re-verifying after each). If it still can't clean up after
+MAX_ATTEMPTS, the failure is reported to Scrooge."""
 import json
 import os
 import subprocess
@@ -36,7 +37,7 @@ def finish(clean):
             pass
     if not clean:
         print(json.dumps({"systemMessage":
-            f"scrooge check: still failing after {MAX_ATTEMPTS} fix attempts, giving up"}))
+            f"scrooge cleanup: still failing after {MAX_ATTEMPTS} fix attempts, giving up"}))
     sys.exit(0)
 
 
@@ -46,16 +47,16 @@ if attempts() >= MAX_ATTEMPTS:
 binary = os.path.join(os.environ.get("CLAUDE_PLUGIN_ROOT", ""), "bin", "scrooge")
 try:
     result = subprocess.run(
-        [binary, "-r", cwd, "check"],
-        capture_output=True, text=True, timeout=600,
+        [binary, "-r", cwd, "cleanup"],
+        capture_output=True, text=True, timeout=900,
     )
 except Exception:
     sys.exit(0)  # never trap the user in a broken hook
 
 if result.returncode == 0:
-    # Code was written this session (the dirty flag got us here) and checks
-    # are green: have Cratchit reconsider .scrooge/overview.md against the
-    # diff and rewrite it if stale. Best-effort — never blocks the stop.
+    # Cleanup succeeded (all checks clean). Have Cratchit reconsider
+    # .scrooge/overview.md against the diff and rewrite it if stale.
+    # Best-effort — never blocks the stop.
     try:
         subprocess.run(
             [binary, "-r", cwd, "refresh-overview"],
@@ -74,15 +75,15 @@ if not report or result.returncode not in (1, 2):
     sys.exit(0)  # binary mismatch or internal error, not a check verdict
 if result.returncode == 1:
     reason = (
-        "Post-task checks failed: the build/tests are broken. Mechanical failures "
+        "Post-task cleanup failed: the build/tests are broken. Mechanical failures "
         "are Cratchit's work — dispatch give_cratchit_task with the failure output "
         "below as the instructions. Only fix it yourself if Cratchit has already "
-        "failed twice on the same failure. Then stop again to re-run the checks.\n\n"
+        "failed twice on the same failure. Then stop again to re-run cleanup.\n\n"
         + report
     )
 else:
     reason = (
-        "Tests pass, but lint warnings remain after mechanical autofix. Delegate "
+        "Tests pass, but lint warnings remain after cleanup attempted fixes. Delegate "
         "fixing them to Cratchit via give_cratchit_task (or the cratchit agent) — "
         "do not burn Scrooge tokens on warning cleanup. If a warning is a false "
         "positive, you may instead adjust .scrooge/checks.toml or add a suppression.\n\n"

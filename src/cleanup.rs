@@ -139,14 +139,14 @@ fn next_problem(root: &Path) -> Result<Option<(String, String)>> {
 
 /// `scrooge cleanup`: autofix via the check suite, then loop — re-checking the
 /// tree and handing Cratchit the next remaining problem one at a time — until
-/// nothing is left to fix.
-pub async fn run(root: &Path) -> Result<()> {
+/// nothing is left to fix. Accepts a borrowed orchestrator so callers (CLI,
+/// MCP) can share one rather than each spinning up their own.
+pub async fn cleanup(orch: &mut Orchestrator, root: &Path) -> Result<()> {
     if next_problem(root)?.is_none() {
         println!("God bless us, every one! (all checks clean)");
         return Ok(());
     }
     eprintln!("Bah! Humbug! Problems remain after autofix — handing them to Cratchit one by one.");
-    let mut orch = Orchestrator::new(root.to_path_buf())?;
     let mut round = 0;
     while let Some((label, detail)) = next_problem(root)? {
         round += 1;
@@ -165,6 +165,12 @@ pub async fn run(root: &Path) -> Result<()> {
     print!("{}", orch.wages_footer());
     println!();
     Ok(())
+}
+
+/// CLI entry point: create an orchestrator and delegate to [`cleanup`].
+pub async fn run(root: &Path) -> Result<()> {
+    let mut orch = Orchestrator::new(root.to_path_buf())?;
+    cleanup(&mut orch, root).await
 }
 
 /// Gate for `run`/`cratchit`: if checks are dirty, shout in bold red, then ask

@@ -10,7 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::agents::Orchestrator;
 use crate::tools::Toolbox;
-use crate::{codemap, helpers, practices};
+use crate::{cleanup, codemap, helpers, practices};
 
 pub struct Server {
     root: PathBuf,
@@ -109,6 +109,12 @@ fn tool_list() -> Value {
             "Ask the user a clarifying question about implementation details. The user must input an answer and press enter before the model continues.",
             &json!({"question": {"type": "string", "description": "the question to ask the user"}}),
             &["question"]
+        ),
+        tool(
+            "cleanup",
+            "Run the full check suite (format, tests, lint autofix), then hand each remaining problem to Cratchit to fix one at a time, re-verifying after each. Zero Scrooge tokens — all fixes are done by Cratchit. Use this instead of dispatching individual fix tasks yourself.",
+            &json!({}),
+            &[]
         ),
     ])
 }
@@ -257,9 +263,10 @@ impl Server {
                 &codemap::build_cached(&self.root)?.languages(),
             )),
             "helpers" => helpers::filtered_listing(&self.root, &s("filter")),
-            "give_cratchit_task" => {
-                let (task, instructions) = (s("task"), s("instructions"));
-                self.orchestrator()?.delegate(&task, &instructions).await
+            "cleanup" => {
+                let root = self.root.clone();
+                cleanup::cleanup(self.orchestrator()?, &root).await?;
+                Ok("done".to_string())
             }
             "ask_cratchit" => {
                 let q = s("question");
