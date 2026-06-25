@@ -89,11 +89,44 @@ const SKIP_DIRS: &[&str] = &[
 
 const MAX_FILE_BYTES: u64 = 262_144;
 
-/// All indexable source files under `root`, skipping vendored/build dirs.
-/// Shared by `build_limited` and `cache_key` so the cache key and the build
-/// always agree on what counts as a source file; also reused by the file-length
-/// lint in `checks.rs`.
+/// The set of files git does not ignore under `root` (tracked + untracked but
+/// not `.gitignore`d), as absolute paths. `None` when `root` is not inside a
+/// git work tree, in which case callers fall back to the raw directory walk.
+/// This is what keeps gitignored files out of every code-map / check /
+/// complexity scan.
+fn git_tracked_set(root: &Path) -> Option<std::collections::HashSet<PathBuf>> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None; // not a git repo, or git unavailable
+    }
+    Some(
+        out.stdout
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| std::str::from_utf8(s).ok())
+            .map(|s| root.join(s))
+            .collect(),
+    )
+}
+
+/// All indexable source files under `root`, skipping vendored/build dirs and
+/// anything git ignores. Shared by `build_limited` and `cache_key` so the cache
+/// key and the build always agree on what counts as a source file; also reused
+/// by the file-length lint in `checks.rs` and the complexity scan, so gitignored
+/// files stay out of every check/audit/cleanup pass too.
 pub fn source_files(root: &Path) -> impl Iterator<Item = walkdir::DirEntry> {
+    let allowed = git_tracked_set(root);
     WalkDir::new(root)
         .into_iter()
         .filter_entry(|e| {
@@ -102,7 +135,11 @@ pub fn source_files(root: &Path) -> impl Iterator<Item = walkdir::DirEntry> {
                 .is_some_and(|n| SKIP_DIRS.contains(&n))
         })
         .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file() && lang_for(e.path()).is_some())
+        .filter(move |e| {
+            e.file_type().is_file()
+                && lang_for(e.path()).is_some()
+                && allowed.as_ref().is_none_or(|set| set.contains(e.path()))
+        })
 }
 
 pub fn build(root: &Path) -> Result<CodeMap> {
@@ -709,5 +746,35 @@ mod tests {
         assert!(!super::contains_word("running the suite", "run"));
         assert!(!super::contains_word("my_run_helper", "run"));
         assert!(!super::contains_word("anything", ""));
+    }
+
+    #[test]
+    fn source_files_excludes_gitignored() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("scrooge_gi_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap();
+        };
+        git(&["init"]);
+        std::fs::write(dir.join(".gitignore"), "ignored.py\ngenerated/\n").unwrap();
+        std::fs::write(dir.join("kept.py"), "def kept(): pass\n").unwrap();
+        std::fs::write(dir.join("ignored.py"), "def gone(): pass\n").unwrap();
+        std::fs::create_dir_all(dir.join("generated")).unwrap();
+        std::fs::write(dir.join("generated").join("g.py"), "def g(): pass\n").unwrap();
+
+        let names: Vec<String> = super::source_files(&dir)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"kept.py".to_string()), "got {names:?}");
+        assert!(!names.contains(&"ignored.py".to_string()), "got {names:?}");
+        assert!(!names.contains(&"g.py".to_string()), "got {names:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
